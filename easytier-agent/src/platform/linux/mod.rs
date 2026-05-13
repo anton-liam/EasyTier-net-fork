@@ -1,0 +1,272 @@
+use crate::{
+    platform::{CommandPlan, PlatformBackend},
+    policy::{DevicePolicy, DevicePolicyRole},
+};
+
+#[derive(Debug, Clone)]
+pub struct LinuxBackend {
+    table_id: u32,
+    mark: String,
+    nft_table: String,
+}
+
+impl Default for LinuxBackend {
+    fn default() -> Self {
+        Self {
+            table_id: 126,
+            mark: "0x7e".to_string(),
+            nft_table: "easytier_agent".to_string(),
+        }
+    }
+}
+
+impl LinuxBackend {
+    pub fn new(table_id: u32, mark: impl Into<String>, nft_table: impl Into<String>) -> Self {
+        Self {
+            table_id,
+            mark: mark.into(),
+            nft_table: nft_table.into(),
+        }
+    }
+
+    fn source_apply(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
+        let exit_peer = policy.exit_peer_ipv4.as_deref().unwrap_or_default();
+        let mut commands = vec![
+            CommandPlan::new("ip", ["route", "show", "default"]),
+            CommandPlan::new(
+                "ip",
+                [
+                    "route",
+                    "replace",
+                    "default",
+                    "via",
+                    exit_peer,
+                    "dev",
+                    "easytier0",
+                    "table",
+                    &self.table_id.to_string(),
+                ],
+            ),
+        ];
+
+        for cidr in &policy.managed_cidrs {
+            commands.push(CommandPlan::new(
+                "ip",
+                [
+                    "rule",
+                    "replace",
+                    "from",
+                    cidr,
+                    "lookup",
+                    &self.table_id.to_string(),
+                ],
+            ));
+        }
+
+        if policy.include_device_traffic {
+            commands.push(CommandPlan::new(
+                "ip",
+                [
+                    "rule",
+                    "replace",
+                    "fwmark",
+                    &self.mark,
+                    "lookup",
+                    &self.table_id.to_string(),
+                ],
+            ));
+        }
+
+        commands
+    }
+
+    fn source_cleanup(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
+        let mut commands = Vec::new();
+        for cidr in &policy.managed_cidrs {
+            commands.push(CommandPlan::new(
+                "ip",
+                [
+                    "rule",
+                    "del",
+                    "from",
+                    cidr,
+                    "lookup",
+                    &self.table_id.to_string(),
+                ],
+            ));
+        }
+        if policy.include_device_traffic {
+            commands.push(CommandPlan::new(
+                "ip",
+                [
+                    "rule",
+                    "del",
+                    "fwmark",
+                    &self.mark,
+                    "lookup",
+                    &self.table_id.to_string(),
+                ],
+            ));
+        }
+        commands
+    }
+
+    fn exit_apply(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
+        let mut commands = vec![
+            CommandPlan::new("sysctl", ["-w", "net.ipv4.ip_forward=1"]),
+            CommandPlan::new("nft", ["add", "table", "inet", &self.nft_table]),
+            CommandPlan::new(
+                "nft",
+                [
+                    "add",
+                    "chain",
+                    "inet",
+                    &self.nft_table,
+                    "postrouting",
+                    "{",
+                    "type",
+                    "nat",
+                    "hook",
+                    "postrouting",
+                    "priority",
+                    "srcnat;",
+                    "}",
+                ],
+            ),
+        ];
+
+        for cidr in &policy.managed_cidrs {
+            commands.push(CommandPlan::new(
+                "nft",
+                [
+                    "add",
+                    "rule",
+                    "inet",
+                    &self.nft_table,
+                    "postrouting",
+                    "ip",
+                    "saddr",
+                    cidr,
+                    "masquerade",
+                    "comment",
+                    &policy.device_policy_id,
+                ],
+            ));
+        }
+
+        commands
+    }
+
+    fn exit_cleanup(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
+        vec![CommandPlan::new(
+            "nft",
+            [
+                "delete",
+                "rule",
+                "inet",
+                &self.nft_table,
+                "postrouting",
+                "comment",
+                &policy.device_policy_id,
+            ],
+        )]
+    }
+}
+
+impl PlatformBackend for LinuxBackend {
+    fn plan_apply(&self, policy: &DevicePolicy) -> anyhow::Result<Vec<CommandPlan>> {
+        policy.validate()?;
+        Ok(match policy.role {
+            DevicePolicyRole::ClientGatewayViaPeer => self.source_apply(policy),
+            DevicePolicyRole::ProvideExitForGateway => self.exit_apply(policy),
+        })
+    }
+
+    fn plan_cleanup(&self, policy: &DevicePolicy) -> anyhow::Result<Vec<CommandPlan>> {
+        policy.validate()?;
+        Ok(match policy.role {
+            DevicePolicyRole::ClientGatewayViaPeer => self.source_cleanup(policy),
+            DevicePolicyRole::ProvideExitForGateway => self.exit_cleanup(policy),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::policy::{ExitEgress, ExitEgressMode};
+
+    fn policy(role: DevicePolicyRole) -> DevicePolicy {
+        DevicePolicy {
+            policy_id: "p1".to_string(),
+            device_policy_id: "p1/source".to_string(),
+            version: 1,
+            role,
+            network_instance_id: Uuid::nil(),
+            source_machine_id: "node-a".to_string(),
+            managed_cidrs: vec!["192.168.10.0/24".to_string()],
+            ingress_ifaces: vec!["br-lan".to_string()],
+            include_device_traffic: true,
+            exit_machine_id: "node-b".to_string(),
+            exit_peer_ipv4: Some("10.126.126.3".to_string()),
+            source_peer_ipv4: Some("10.126.126.2".to_string()),
+            exit_egress: ExitEgress {
+                mode: ExitEgressMode::Auto,
+                iface: None,
+            },
+            protect_control_plane: true,
+            rollback_enabled: true,
+        }
+    }
+
+    #[test]
+    fn source_apply_plan_is_idempotent_shape() {
+        let backend = LinuxBackend::default();
+        let commands = backend
+            .plan_apply(&policy(DevicePolicyRole::ClientGatewayViaPeer))
+            .unwrap();
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "ip"
+                && cmd.args.starts_with(&["route".to_string(), "replace".to_string()])
+        }));
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "ip"
+                && cmd.args.starts_with(&["rule".to_string(), "replace".to_string()])
+        }));
+    }
+
+    #[test]
+    fn source_cleanup_only_targets_this_policy_shape() {
+        let backend = LinuxBackend::default();
+        let commands = backend
+            .plan_cleanup(&policy(DevicePolicyRole::ClientGatewayViaPeer))
+            .unwrap();
+        assert!(commands.iter().all(|cmd| cmd.program == "ip"));
+        assert!(commands.iter().any(|cmd| cmd.args.contains(&"del".to_string())));
+    }
+
+    #[test]
+    fn exit_apply_adds_nat_for_managed_cidr() {
+        let backend = LinuxBackend::default();
+        let commands = backend
+            .plan_apply(&policy(DevicePolicyRole::ProvideExitForGateway))
+            .unwrap();
+        assert!(commands.iter().any(|cmd| cmd.program == "sysctl"));
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "nft" && cmd.args.contains(&"192.168.10.0/24".to_string())
+        }));
+    }
+
+    #[test]
+    fn exit_cleanup_targets_policy_comment() {
+        let backend = LinuxBackend::default();
+        let commands = backend
+            .plan_cleanup(&policy(DevicePolicyRole::ProvideExitForGateway))
+            .unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].args.contains(&"p1/source".to_string()));
+    }
+}
+
