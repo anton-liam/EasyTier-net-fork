@@ -2380,6 +2380,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "easytier-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.11",
+ "uuid",
+]
+
+[[package]]
 name = "easytier-android-jni"
 version = "0.1.0"
 dependencies = [
