@@ -26,6 +26,7 @@ use mimalloc::MiMalloc;
 
 mod client_manager;
 mod db;
+mod gateway_policy;
 mod migrator;
 mod restful;
 mod webhook;

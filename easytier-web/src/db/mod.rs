@@ -13,9 +13,10 @@ use sea_orm::{
     SqlxSqliteConnector, TransactionTrait as _, prelude::Expr, sea_query::OnConflict,
 };
 use sea_orm_migration::MigratorTrait as _;
-use sqlx::{Sqlite, SqlitePool, migrate::MigrateDatabase as _, types::chrono};
+use sqlx::{Row, Sqlite, SqlitePool, migrate::MigrateDatabase as _, types::chrono};
 use uuid::Uuid;
 
+use crate::gateway_policy::{GatewayFullTunnelPolicy, RuntimeReport, validate_policy_conflicts};
 use crate::migrator;
 use async_trait::async_trait;
 
@@ -140,6 +141,140 @@ impl Db {
         token: T,
     ) -> Result<Option<UserIdInDb>, DbErr> {
         self.get_user_id(token).await
+    }
+
+    pub async fn upsert_gateway_policy(
+        &self,
+        user_id: UserIdInDb,
+        policy: GatewayFullTunnelPolicy,
+    ) -> Result<(), DbErr> {
+        let existing = self.list_gateway_policies(user_id).await?;
+        validate_policy_conflicts(&existing, &policy).map_err(|e| DbErr::Custom(e.to_string()))?;
+        let policy_json = serde_json::to_string(&policy).map_err(|e| DbErr::Json(e.to_string()))?;
+        let now = chrono::Local::now().fixed_offset().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO gateway_full_tunnel_policies (
+                user_id,
+                policy_id,
+                policy_json,
+                enabled,
+                source_machine_id,
+                exit_machine_id,
+                desired_version,
+                create_time,
+                update_time
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, policy_id) DO UPDATE SET
+                policy_json = excluded.policy_json,
+                enabled = excluded.enabled,
+                source_machine_id = excluded.source_machine_id,
+                exit_machine_id = excluded.exit_machine_id,
+                desired_version = excluded.desired_version,
+                update_time = excluded.update_time
+            "#,
+        )
+        .bind(user_id)
+        .bind(policy.policy_id.to_string())
+        .bind(policy_json)
+        .bind(policy.enabled)
+        .bind(policy.source_machine_id.to_string())
+        .bind(policy.exit_machine_id.to_string())
+        .bind(policy.desired_version as i64)
+        .bind(now.clone())
+        .bind(now)
+        .execute(&self.db)
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+
+        Ok(())
+    }
+
+    pub async fn list_gateway_policies(
+        &self,
+        user_id: UserIdInDb,
+    ) -> Result<Vec<GatewayFullTunnelPolicy>, DbErr> {
+        let rows = sqlx::query(
+            r#"
+            SELECT policy_json
+            FROM gateway_full_tunnel_policies
+            WHERE user_id = ?
+            ORDER BY policy_id
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let policy_json: String = row.get("policy_json");
+                serde_json::from_str(&policy_json).map_err(|e| DbErr::Json(e.to_string()))
+            })
+            .collect()
+    }
+
+    pub async fn upsert_gateway_runtime_report(
+        &self,
+        user_id: UserIdInDb,
+        report: RuntimeReport,
+    ) -> Result<(), DbErr> {
+        let report_json = serde_json::to_string(&report).map_err(|e| DbErr::Json(e.to_string()))?;
+        let now = chrono::Local::now().fixed_offset().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO gateway_runtime_reports (
+                user_id,
+                machine_id,
+                report_json,
+                easytier_ipv4,
+                update_time
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, machine_id) DO UPDATE SET
+                report_json = excluded.report_json,
+                easytier_ipv4 = excluded.easytier_ipv4,
+                update_time = excluded.update_time
+            "#,
+        )
+        .bind(user_id)
+        .bind(report.machine_id.to_string())
+        .bind(report_json)
+        .bind(report.easytier_ipv4.clone())
+        .bind(now)
+        .execute(&self.db)
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+
+        Ok(())
+    }
+
+    pub async fn list_gateway_runtime_reports(
+        &self,
+        user_id: UserIdInDb,
+    ) -> Result<Vec<RuntimeReport>, DbErr> {
+        let rows = sqlx::query(
+            r#"
+            SELECT report_json
+            FROM gateway_runtime_reports
+            WHERE user_id = ?
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let report_json: String = row.get("report_json");
+                serde_json::from_str(&report_json).map_err(|e| DbErr::Json(e.to_string()))
+            })
+            .collect()
     }
 }
 
@@ -289,6 +424,9 @@ mod tests {
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter as _, Set};
 
     use crate::db::{Db, ListNetworkProps, entity::user_running_network_configs};
+    use crate::gateway_policy::{
+        ExitEgress, GatewayFullTunnelPolicy, HealthcheckConfig, RollbackConfig, RuntimeReport,
+    };
 
     #[tokio::test]
     async fn test_user_network_config_management() {
@@ -467,5 +605,65 @@ mod tests {
             .unwrap();
         assert_eq!(device1_configs.len(), 1);
         assert_eq!(device2_configs.len(), 1);
+    }
+
+    fn base_gateway_policy(source: uuid::Uuid, exit: uuid::Uuid) -> GatewayFullTunnelPolicy {
+        GatewayFullTunnelPolicy {
+            policy_id: uuid::Uuid::new_v4(),
+            enabled: true,
+            network_instance_id: uuid::Uuid::new_v4(),
+            source_machine_id: source,
+            managed_cidrs: vec!["192.168.10.0/24".to_string()],
+            ingress_ifaces: vec!["br-lan".to_string()],
+            include_device_traffic: true,
+            exit_machine_id: exit,
+            exit_egress: ExitEgress::default(),
+            desired_version: 1,
+            protect_control_plane: true,
+            healthcheck: HealthcheckConfig::default(),
+            rollback: RollbackConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gateway_policy_and_report_persistence() {
+        let db = Db::memory_db().await;
+        let user_id = db.auto_create_user("gateway-user").await.unwrap().id;
+        let source = uuid::Uuid::new_v4();
+        let exit = uuid::Uuid::new_v4();
+        let policy = base_gateway_policy(source, exit);
+
+        db.upsert_gateway_policy(user_id, policy.clone())
+            .await
+            .unwrap();
+        let policies = db.list_gateway_policies(user_id).await.unwrap();
+        assert_eq!(policies, vec![policy.clone()]);
+
+        let duplicate_source = base_gateway_policy(source, uuid::Uuid::new_v4());
+        assert!(
+            db.upsert_gateway_policy(user_id, duplicate_source)
+                .await
+                .is_err()
+        );
+
+        db.upsert_gateway_runtime_report(
+            user_id,
+            RuntimeReport {
+                machine_id: source,
+                agent_version: "0.1.0".to_string(),
+                easytier_ipv4: Some("10.126.126.2".to_string()),
+                observed_policy_id: Some(policy.policy_id),
+                observed_policy_version: Some(policy.desired_version),
+                observed_policy_status: Some("active".to_string()),
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let reports = db.list_gateway_runtime_reports(user_id).await.unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].machine_id, source);
+        assert_eq!(reports[0].easytier_ipv4.as_deref(), Some("10.126.126.2"));
     }
 }

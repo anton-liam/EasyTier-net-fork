@@ -18,8 +18,10 @@ use easytier::{
 use maxminddb::geoip2;
 use session::{Location, Session};
 use storage::{Storage, StorageToken};
+use tokio::sync::RwLock;
 
 use crate::FeatureFlags;
+use crate::gateway_policy::{DevicePolicy, GatewayFullTunnelPolicy, PolicyStore, RuntimeReport};
 use crate::webhook::SharedWebhookConfig;
 use tokio::task::JoinSet;
 
@@ -63,6 +65,7 @@ pub struct ClientManager {
     webhook_config: SharedWebhookConfig,
 
     geoip_db: Arc<Option<maxminddb::Reader<Vec<u8>>>>,
+    gateway_policy_store: Arc<RwLock<PolicyStore>>,
 }
 
 impl ClientManager {
@@ -92,6 +95,7 @@ impl ClientManager {
             webhook_config,
 
             geoip_db: Arc::new(load_geoip_db(geoip_db)),
+            gateway_policy_store: Arc::new(RwLock::new(PolicyStore::default())),
         }
     }
 
@@ -209,6 +213,70 @@ impl ClientManager {
 
     fn db(&self) -> &Db {
         self.storage.db()
+    }
+
+    pub async fn upsert_gateway_policy(
+        &self,
+        user_id: UserIdInDb,
+        policy: GatewayFullTunnelPolicy,
+    ) -> Result<(), anyhow::Error> {
+        self.storage
+            .db()
+            .upsert_gateway_policy(user_id, policy.clone())
+            .await?;
+        self.gateway_policy_store
+            .write()
+            .await
+            .upsert_policy(user_id, policy)?;
+        Ok(())
+    }
+
+    pub async fn list_gateway_policies(
+        &self,
+        user_id: UserIdInDb,
+    ) -> Result<Vec<GatewayFullTunnelPolicy>, anyhow::Error> {
+        self.storage
+            .db()
+            .list_gateway_policies(user_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn gateway_device_policies(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+    ) -> Result<Vec<DevicePolicy>, anyhow::Error> {
+        let policies = self.storage.db().list_gateway_policies(user_id).await?;
+        let reports = self
+            .storage
+            .db()
+            .list_gateway_runtime_reports(user_id)
+            .await?;
+        let mut store = PolicyStore::default();
+        for policy in policies {
+            store.upsert_policy(user_id, policy)?;
+        }
+        for report in reports {
+            store.update_report(user_id, report);
+        }
+        Ok(store.device_policies_for_machine(user_id, machine_id)?)
+    }
+
+    pub async fn update_gateway_runtime_report(
+        &self,
+        user_id: UserIdInDb,
+        report: RuntimeReport,
+    ) -> Result<(), anyhow::Error> {
+        self.storage
+            .db()
+            .upsert_gateway_runtime_report(user_id, report.clone())
+            .await?;
+        self.gateway_policy_store
+            .write()
+            .await
+            .update_report(user_id, report);
+        Ok(())
     }
 
     fn lookup_location(
