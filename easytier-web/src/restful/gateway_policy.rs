@@ -1,11 +1,13 @@
 use axum::extract::Path;
 use axum::http::StatusCode;
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::{Json, Router, extract::State};
 use axum_login::AuthUser;
 
 use crate::db::UserIdInDb;
-use crate::gateway_policy::{GatewayFullTunnelPolicy, PolicyError, RuntimeReport};
+use crate::gateway_policy::{
+    GatewayFullTunnelPolicy, GatewayPolicySnapshot, PolicyError, RuntimeReport,
+};
 
 use super::users::AuthSession;
 use super::{AppState, AppStateInner, Error, HttpHandleError, other_error};
@@ -67,6 +69,25 @@ impl GatewayPolicyApi {
         ))
     }
 
+    async fn handle_get_policy(
+        auth_session: AuthSession,
+        State(client_mgr): AppState,
+        Path(policy_id): Path<uuid::Uuid>,
+    ) -> Result<Json<GatewayPolicySnapshot>, HttpHandleError> {
+        let user_id = Self::get_user_id(&auth_session)?;
+        let Some(snapshot) = client_mgr
+            .get_gateway_policy_snapshot(user_id, policy_id)
+            .await
+            .map_err(convert_anyhow_error)?
+        else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                other_error("gateway policy not found").into(),
+            ));
+        };
+        Ok(Json(snapshot))
+    }
+
     async fn handle_get_device_policies_internal(
         State(client_mgr): AppState,
         Path((user_id, machine_id)): Path<(UserIdInDb, uuid::Uuid)>,
@@ -100,7 +121,7 @@ impl GatewayPolicyApi {
             )
             .route(
                 "/api/v1/gateway-policies/:policy-id",
-                put(Self::handle_upsert_policy),
+                get(Self::handle_get_policy).put(Self::handle_upsert_policy),
             )
     }
 

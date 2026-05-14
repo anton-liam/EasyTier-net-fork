@@ -21,7 +21,9 @@ use storage::{Storage, StorageToken};
 use tokio::sync::RwLock;
 
 use crate::FeatureFlags;
-use crate::gateway_policy::{DevicePolicy, GatewayFullTunnelPolicy, PolicyStore, RuntimeReport};
+use crate::gateway_policy::{
+    DevicePolicy, GatewayFullTunnelPolicy, GatewayPolicySnapshot, PolicyStore, RuntimeReport,
+};
 use crate::webhook::SharedWebhookConfig;
 use tokio::task::JoinSet;
 
@@ -242,11 +244,36 @@ impl ClientManager {
             .map_err(Into::into)
     }
 
+    pub async fn get_gateway_policy_snapshot(
+        &self,
+        user_id: UserIdInDb,
+        policy_id: uuid::Uuid,
+    ) -> Result<Option<GatewayPolicySnapshot>, anyhow::Error> {
+        let store = self.gateway_policy_store(user_id).await?;
+        Ok(store.policy_snapshot(user_id, policy_id))
+    }
+
+    pub async fn list_gateway_policy_snapshots(
+        &self,
+        user_id: UserIdInDb,
+    ) -> Result<Vec<GatewayPolicySnapshot>, anyhow::Error> {
+        let store = self.gateway_policy_store(user_id).await?;
+        Ok(store.list_policy_snapshots(user_id))
+    }
+
     pub async fn gateway_device_policies(
         &self,
         user_id: UserIdInDb,
         machine_id: uuid::Uuid,
     ) -> Result<Vec<DevicePolicy>, anyhow::Error> {
+        let store = self.gateway_policy_store(user_id).await?;
+        Ok(store.device_policies_for_machine(user_id, machine_id)?)
+    }
+
+    async fn gateway_policy_store(
+        &self,
+        user_id: UserIdInDb,
+    ) -> Result<PolicyStore, anyhow::Error> {
         let policies = self.storage.db().list_gateway_policies(user_id).await?;
         let reports = self
             .storage
@@ -260,7 +287,7 @@ impl ClientManager {
         for report in reports {
             store.update_report(user_id, report);
         }
-        Ok(store.device_policies_for_machine(user_id, machine_id)?)
+        Ok(store)
     }
 
     pub async fn update_gateway_runtime_report(

@@ -68,6 +68,35 @@ pub struct RuntimeReport {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPolicySnapshot {
+    pub desired: GatewayFullTunnelPolicy,
+    pub observed: GatewayPolicyObservedState,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPolicyObservedState {
+    #[serde(default)]
+    pub source: Option<GatewayPolicyObservedNode>,
+    #[serde(default)]
+    pub exit: Option<GatewayPolicyObservedNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPolicyObservedNode {
+    pub machine_id: Uuid,
+    pub agent_version: String,
+    #[serde(default)]
+    pub easytier_ipv4: Option<String>,
+    #[serde(default)]
+    pub policy_id: Option<Uuid>,
+    #[serde(default)]
+    pub version: Option<u64>,
+    pub status: String,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct PolicyStore {
     policies: HashMap<(i32, Uuid), GatewayFullTunnelPolicy>,
@@ -266,6 +295,30 @@ impl PolicyStore {
         policies
     }
 
+    pub fn list_policy_snapshots(&self, user_id: i32) -> Vec<GatewayPolicySnapshot> {
+        self.list_policies(user_id)
+            .into_iter()
+            .filter_map(|policy| self.policy_snapshot(user_id, policy.policy_id))
+            .collect()
+    }
+
+    pub fn policy_snapshot(&self, user_id: i32, policy_id: Uuid) -> Option<GatewayPolicySnapshot> {
+        let desired = self.policies.get(&(user_id, policy_id))?.clone();
+        let source = self
+            .reports
+            .get(&(user_id, desired.source_machine_id))
+            .map(GatewayPolicyObservedNode::from);
+        let exit = self
+            .reports
+            .get(&(user_id, desired.exit_machine_id))
+            .map(GatewayPolicyObservedNode::from);
+
+        Some(GatewayPolicySnapshot {
+            desired,
+            observed: GatewayPolicyObservedState { source, exit },
+        })
+    }
+
     pub fn device_policies_for_machine(
         &self,
         user_id: i32,
@@ -297,6 +350,23 @@ impl PolicyStore {
             }
         }
         Ok(policies)
+    }
+}
+
+impl From<&RuntimeReport> for GatewayPolicyObservedNode {
+    fn from(report: &RuntimeReport) -> Self {
+        Self {
+            machine_id: report.machine_id,
+            agent_version: report.agent_version.clone(),
+            easytier_ipv4: report.easytier_ipv4.clone(),
+            policy_id: report.observed_policy_id,
+            version: report.observed_policy_version,
+            status: report
+                .observed_policy_status
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            last_error: report.last_error.clone(),
+        }
     }
 }
 
@@ -464,5 +534,58 @@ mod tests {
 
         assert_eq!(store.list_policies(1).len(), 1);
         assert_eq!(store.list_policies(2).len(), 1);
+    }
+
+    #[test]
+    fn store_returns_policy_snapshot_with_observed_state() {
+        let source = Uuid::new_v4();
+        let exit = Uuid::new_v4();
+        let policy = base_policy(source, exit);
+        let mut store = PolicyStore::default();
+        store.upsert_policy(1, policy.clone()).unwrap();
+        store.update_report(
+            1,
+            RuntimeReport {
+                machine_id: source,
+                agent_version: "0.1.0".to_string(),
+                easytier_ipv4: Some("10.126.126.2".to_string()),
+                observed_policy_id: Some(policy.policy_id),
+                observed_policy_version: Some(policy.desired_version),
+                observed_policy_status: Some("active".to_string()),
+                last_error: None,
+            },
+        );
+        store.update_report(
+            1,
+            RuntimeReport {
+                machine_id: exit,
+                agent_version: "0.1.0".to_string(),
+                easytier_ipv4: Some("10.126.126.3".to_string()),
+                observed_policy_id: Some(policy.policy_id),
+                observed_policy_version: Some(policy.desired_version),
+                observed_policy_status: Some("prepared".to_string()),
+                last_error: None,
+            },
+        );
+
+        let snapshot = store.policy_snapshot(1, policy.policy_id).unwrap();
+
+        assert_eq!(snapshot.desired, policy);
+        assert_eq!(
+            snapshot
+                .observed
+                .source
+                .as_ref()
+                .map(|node| node.status.as_str()),
+            Some("active")
+        );
+        assert_eq!(
+            snapshot
+                .observed
+                .exit
+                .as_ref()
+                .map(|node| node.status.as_str()),
+            Some("prepared")
+        );
     }
 }
