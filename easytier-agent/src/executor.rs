@@ -15,6 +15,20 @@ pub struct CommandExecutionReport {
     pub executed_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandExecutionFailure {
+    pub report: CommandExecutionReport,
+    pub error: String,
+}
+
+impl std::fmt::Display for CommandExecutionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for CommandExecutionFailure {}
+
 pub trait CommandExecutor {
     fn execute(&mut self, command: &CommandPlan) -> anyhow::Result<()>;
 }
@@ -42,7 +56,7 @@ pub fn apply_command_plan<E>(
     commands: Vec<CommandPlan>,
     mode: CommandExecutionMode,
     executor: &mut E,
-) -> anyhow::Result<CommandExecutionReport>
+) -> Result<CommandExecutionReport, CommandExecutionFailure>
 where
     E: CommandExecutor,
 {
@@ -56,7 +70,16 @@ where
 
     let mut executed_count = 0;
     for command in &commands {
-        executor.execute(command)?;
+        if let Err(error) = executor.execute(command) {
+            return Err(CommandExecutionFailure {
+                report: CommandExecutionReport {
+                    dry_run: false,
+                    commands,
+                    executed_count,
+                },
+                error: error.to_string(),
+            });
+        }
         executed_count += 1;
     }
 
@@ -143,5 +166,6 @@ mod tests {
 
         assert!(err.to_string().contains("synthetic command failure"));
         assert_eq!(executor.commands.len(), 1);
+        assert_eq!(err.report.executed_count, 1);
     }
 }

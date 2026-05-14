@@ -2,7 +2,9 @@ use std::{fs, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use easytier_agent::{
-    CommandExecutionMode, DevicePolicy, PlatformBackend, SystemCommandExecutor, apply_command_plan,
+    AgentRuntimeReport, CommandExecutionMode, DevicePolicy, PlatformBackend,
+    SystemCommandExecutor, apply_command_plan, build_runtime_report,
+    build_runtime_report_from_failure, derive_policy_status,
     dry_run_plan, platform::linux::LinuxBackend,
 };
 
@@ -47,13 +49,15 @@ fn main() -> anyhow::Result<()> {
             let policy = read_policy(policy)?;
             let backend = LinuxBackend::default();
             let commands = backend.plan_apply(&policy)?;
-            run_command_plan(commands, execute)?;
+            let report = run_command_plan("localhost", &policy, commands, execute);
+            println!("{}", serde_json::to_string(&report)?);
         }
         Command::Cleanup { policy, execute } => {
             let policy = read_policy(policy)?;
             let backend = LinuxBackend::default();
             let commands = backend.plan_cleanup(&policy)?;
-            run_command_plan(commands, execute)?;
+            let report = run_command_plan("localhost", &policy, commands, execute);
+            println!("{}", serde_json::to_string(&report)?);
         }
     }
 
@@ -66,24 +70,36 @@ fn read_policy(path: PathBuf) -> anyhow::Result<DevicePolicy> {
 }
 
 fn run_command_plan(
+    machine_id: impl Into<String>,
+    policy: &DevicePolicy,
     commands: Vec<easytier_agent::CommandPlan>,
     execute: bool,
-) -> anyhow::Result<()> {
+) -> AgentRuntimeReport {
     let mode = if execute {
         CommandExecutionMode::Execute
     } else {
         CommandExecutionMode::DryRun
     };
     let mut executor = SystemCommandExecutor;
-    let report = apply_command_plan(commands, mode, &mut executor)?;
-
-    for command in &report.commands {
-        println!("{} {}", command.program, command.args.join(" "));
+    match apply_command_plan(commands, mode, &mut executor) {
+        Ok(command_report) => {
+            for command in &command_report.commands {
+                println!("{} {}", command.program, command.args.join(" "));
+            }
+            if command_report.dry_run {
+                println!("dry_run: true");
+            } else {
+                println!("executed_count: {}", command_report.executed_count);
+            }
+            let status = derive_policy_status(&command_report, None, false);
+            build_runtime_report(machine_id, policy, status, &command_report, None)
+        }
+        Err(failure) => {
+            for command in &failure.report.commands {
+                println!("{} {}", command.program, command.args.join(" "));
+            }
+            println!("executed_count: {}", failure.report.executed_count);
+            build_runtime_report_from_failure(machine_id, policy, &failure)
+        }
     }
-    if report.dry_run {
-        println!("dry_run: true");
-    } else {
-        println!("executed_count: {}", report.executed_count);
-    }
-    Ok(())
 }

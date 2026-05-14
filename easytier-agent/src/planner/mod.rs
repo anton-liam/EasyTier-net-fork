@@ -44,8 +44,9 @@ fn source_plan(policy: &DevicePolicy) -> Vec<PlanAction> {
     vec![
         PlanAction {
             kind: PlanActionKind::ProtectControlPlane,
-            description: "ensure Web/config-server/relay/SSH underlay routes stay outside the tunnel"
-                .to_string(),
+            description:
+                "ensure Web/config-server/relay/SSH underlay routes stay outside the tunnel"
+                    .to_string(),
         },
         PlanAction {
             kind: PlanActionKind::RouteManagedTraffic,
@@ -85,7 +86,10 @@ fn describe_managed_traffic(policy: &DevicePolicy) -> String {
         parts.push(format!("managed_cidrs={}", policy.managed_cidrs.join(",")));
     }
     if !policy.ingress_ifaces.is_empty() {
-        parts.push(format!("ingress_ifaces={}", policy.ingress_ifaces.join(",")));
+        parts.push(format!(
+            "ingress_ifaces={}",
+            policy.ingress_ifaces.join(",")
+        ));
     }
     if policy.include_device_traffic {
         parts.push("include_device_traffic=true".to_string());

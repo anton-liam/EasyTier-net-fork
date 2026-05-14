@@ -48,13 +48,7 @@ impl ControlPlaneGuard {
             .map(|endpoint| {
                 CommandPlan::new(
                     "ip",
-                    [
-                        "route",
-                        "replace",
-                        &endpoint.host,
-                        "scope",
-                        "global",
-                    ],
+                    ["route", "replace", &endpoint.host, "scope", "global"],
                 )
             })
             .collect()
@@ -99,10 +93,8 @@ mod tests {
 
     #[test]
     fn fails_when_endpoint_unreachable() {
-        let guard = ControlPlaneGuard::new(vec![ControlPlaneEndpoint::new(
-            "web",
-            "192.168.64.4/32",
-        )]);
+        let guard =
+            ControlPlaneGuard::new(vec![ControlPlaneEndpoint::new("web", "192.168.64.4/32")]);
         let probe = Probe {
             reachable: HashSet::new(),
         };

@@ -131,14 +131,8 @@ mod tests {
             reachable: HashSet::new(),
         };
         let mut state = MemoryStateStore::default();
-        let err = apply_with_control_plane_guard(
-            &backend,
-            &probe,
-            &mut state,
-            &guard(),
-            &policy(),
-        )
-        .unwrap_err();
+        let err = apply_with_control_plane_guard(&backend, &probe, &mut state, &guard(), &policy())
+            .unwrap_err();
         assert!(matches!(err, ApplyError::Preflight(_)));
     }
 
@@ -149,14 +143,9 @@ mod tests {
             reachable: ["web".to_string()].into_iter().collect(),
         };
         let mut state = MemoryStateStore::default();
-        let outcome = apply_with_control_plane_guard(
-            &backend,
-            &probe,
-            &mut state,
-            &guard(),
-            &policy(),
-        )
-        .unwrap();
+        let outcome =
+            apply_with_control_plane_guard(&backend, &probe, &mut state, &guard(), &policy())
+                .unwrap();
         assert_eq!(outcome.status, PolicyStatus::Active);
         assert!(state.last_known_good().is_some());
     }
@@ -168,14 +157,9 @@ mod tests {
             first: Cell::new(true),
         };
         let mut state = MemoryStateStore::default();
-        let outcome = apply_with_control_plane_guard(
-            &backend,
-            &probe,
-            &mut state,
-            &guard(),
-            &policy(),
-        )
-        .unwrap();
+        let outcome =
+            apply_with_control_plane_guard(&backend, &probe, &mut state, &guard(), &policy())
+                .unwrap();
         assert_eq!(outcome.status, PolicyStatus::Rollbacked);
         assert!(!outcome.rollback_plan.is_empty());
     }

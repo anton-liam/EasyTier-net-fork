@@ -130,7 +130,13 @@ impl DevicePolicy {
             }
         }
         if matches!(self.exit_egress.mode, ExitEgressMode::Interface)
-            && self.exit_egress.iface.as_deref().unwrap_or("").trim().is_empty()
+            && self
+                .exit_egress
+                .iface
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
         {
             return Err(PolicyError::MissingField("exit_egress.iface"));
         }
