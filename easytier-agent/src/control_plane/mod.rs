@@ -43,16 +43,29 @@ impl ControlPlaneGuard {
     }
 
     pub fn protected_route_plan(&self) -> Vec<CommandPlan> {
+        self.protected_route_plan_for_table(None)
+    }
+
+    pub fn protected_route_plan_for_table(&self, table_id: Option<u32>) -> Vec<CommandPlan> {
         self.endpoints
             .iter()
             .map(|endpoint| {
-                CommandPlan::new(
-                    "ip",
-                    ["route", "replace", &endpoint.host, "scope", "global"],
-                )
+                let host = endpoint.host.trim_end_matches("/32");
+                let quoted_host = shell_single_quote(host);
+                let table = table_id
+                    .map(|id| format!(" table {id}"))
+                    .unwrap_or_default();
+                let script = format!(
+                    "host={quoted_host}; route=\"$(ip route get \"$host\" | head -n1)\"; dev=\"$(printf '%s\\n' \"$route\" | awk '{{ for (i=1;i<=NF;i++) if ($i==\"dev\") {{ print $(i+1); exit }} }}')\"; via=\"$(printf '%s\\n' \"$route\" | awk '{{ for (i=1;i<=NF;i++) if ($i==\"via\") {{ print $(i+1); exit }} }}')\"; test -n \"$dev\"; if [ -n \"$via\" ]; then ip route replace \"$host/32\" via \"$via\" dev \"$dev\"{table}; else ip route replace \"$host/32\" dev \"$dev\"{table}; fi"
+                );
+                CommandPlan::new("sh", ["-c", &script])
             })
             .collect()
     }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

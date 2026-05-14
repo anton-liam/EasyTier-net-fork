@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CommandExecutionReport, DevicePolicy, PolicyStatus, executor::CommandExecutionFailure,
+    CommandExecutionReport, DevicePolicy, DevicePolicyRole, PolicyStatus,
+    executor::CommandExecutionFailure,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +81,19 @@ pub fn derive_policy_status(
         return PolicyStatus::Active;
     }
     PolicyStatus::Prepared
+}
+
+pub fn derive_policy_status_for_policy(
+    policy: &DevicePolicy,
+    command_report: &CommandExecutionReport,
+    last_error: Option<&str>,
+    rollbacked: bool,
+) -> PolicyStatus {
+    let status = derive_policy_status(command_report, last_error, rollbacked);
+    if status == PolicyStatus::Active && policy.role == DevicePolicyRole::ProvideExitForGateway {
+        return PolicyStatus::Prepared;
+    }
+    status
 }
 
 #[cfg(test)]
@@ -190,6 +204,23 @@ mod tests {
         assert_eq!(
             derive_policy_status(&command_report, None, false),
             PolicyStatus::Active
+        );
+    }
+
+    #[test]
+    fn derives_prepared_for_successful_exit_provider() {
+        let mut policy = policy();
+        policy.role = DevicePolicyRole::ProvideExitForGateway;
+        policy.source_peer_ipv4 = Some("10.126.126.2".to_string());
+        policy.exit_peer_ipv4 = None;
+        let commands = vec![CommandPlan::new("sysctl", ["-w", "net.ipv4.ip_forward=1"])];
+        let mut executor = NoopExecutor;
+        let command_report =
+            apply_command_plan(commands, CommandExecutionMode::Execute, &mut executor).unwrap();
+
+        assert_eq!(
+            derive_policy_status_for_policy(&policy, &command_report, None, false),
+            PolicyStatus::Prepared
         );
     }
 

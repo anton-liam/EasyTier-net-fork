@@ -2,10 +2,10 @@ use std::{fs, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use easytier_agent::{
-    AgentRuntimeReport, CommandExecutionMode, DevicePolicy, PlatformBackend, ReportTarget,
-    SystemCommandExecutor, apply_command_plan, build_runtime_report,
-    build_runtime_report_from_failure, derive_policy_status, dry_run_plan,
-    platform::linux::LinuxBackend, post_runtime_report,
+    AgentRuntimeReport, CommandExecutionMode, CommandPlan, ControlPlaneEndpoint, ControlPlaneGuard,
+    DevicePolicy, PlatformBackend, ReportTarget, SystemCommandExecutor, apply_command_plan,
+    build_runtime_report, build_runtime_report_from_failure, derive_policy_status_for_policy,
+    dry_run_plan, platform::linux::LinuxBackend, post_runtime_report,
 };
 
 #[derive(Debug, Parser)]
@@ -105,6 +105,56 @@ mod tests {
 
         assert!(err.to_string().contains("all web report flags"));
     }
+
+    #[test]
+    fn apply_plan_protects_web_control_plane_before_gateway_rules() {
+        let policy: easytier_agent::DevicePolicy = serde_json::from_str(&format!(
+            r#"{{
+              "policy_id": "p1",
+              "device_policy_id": "p1/source",
+              "version": 1,
+              "role": "client_gateway_via_peer",
+              "network_instance_id": "{}",
+              "source_machine_id": "node-a",
+              "managed_cidrs": ["192.168.10.0/24"],
+              "ingress_ifaces": ["br-lan"],
+              "include_device_traffic": true,
+              "exit_machine_id": "node-b",
+              "exit_peer_ipv4": "10.126.126.3",
+              "protect_control_plane": true,
+              "rollback_enabled": true
+            }}"#,
+            uuid::Uuid::nil()
+        ))
+        .unwrap();
+
+        let commands = super::apply_commands_for_policy(
+            &policy,
+            Some("http://192.168.64.4:11211".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(commands[0].program, "sh");
+        assert!(commands[0].args.join(" ").contains("host='192.168.64.4'"));
+        assert!(
+            commands[0]
+                .args
+                .join(" ")
+                .contains("ip route get \"$host\"")
+        );
+        assert!(
+            commands[0]
+                .args
+                .join(" ")
+                .contains("ip route replace \"$host/32\"")
+        );
+        assert!(commands.iter().skip(1).any(|command| {
+            command.program == "ip"
+                && command
+                    .args
+                    .starts_with(&["route".to_string(), "replace".to_string()])
+        }));
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -127,8 +177,7 @@ fn main() -> anyhow::Result<()> {
             execute,
         } => {
             let policy = read_policy(policy)?;
-            let backend = LinuxBackend::default();
-            let commands = backend.plan_apply(&policy)?;
+            let commands = apply_commands_for_policy(&policy, web_base_url.clone())?;
             let report_target = report_target_from_flags(
                 web_base_url,
                 user_id,
@@ -195,6 +244,51 @@ fn report_target_from_flags(
     }
 }
 
+fn apply_commands_for_policy(
+    policy: &DevicePolicy,
+    web_base_url: Option<String>,
+) -> anyhow::Result<Vec<CommandPlan>> {
+    let backend = LinuxBackend::default();
+    let mut commands = control_plane_commands(policy, web_base_url)?;
+    commands.extend(backend.plan_apply(policy)?);
+    Ok(commands)
+}
+
+fn control_plane_commands(
+    policy: &DevicePolicy,
+    web_base_url: Option<String>,
+) -> anyhow::Result<Vec<CommandPlan>> {
+    if !policy.protect_control_plane {
+        return Ok(Vec::new());
+    }
+    let Some(web_base_url) = web_base_url else {
+        return Ok(Vec::new());
+    };
+    let Some(host) = host_from_url_like(&web_base_url) else {
+        anyhow::bail!("invalid --web-base-url: missing host");
+    };
+    let backend = LinuxBackend::default();
+    Ok(
+        ControlPlaneGuard::new(vec![ControlPlaneEndpoint::new("web", host)])
+            .protected_route_plan_for_table(Some(backend.table_id())),
+    )
+}
+
+fn host_from_url_like(value: &str) -> Option<String> {
+    let without_scheme = value.split_once("://").map_or(value, |(_, rest)| rest);
+    let authority = without_scheme.split('/').next()?.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
+        .split(':')
+        .next()?
+        .trim();
+    (!host.is_empty()).then(|| host.to_string())
+}
+
 fn run_command_plan(
     machine_id: impl Into<String>,
     easytier_ipv4: Option<String>,
@@ -218,7 +312,7 @@ fn run_command_plan(
             } else {
                 println!("executed_count: {}", command_report.executed_count);
             }
-            let status = derive_policy_status(&command_report, None, false);
+            let status = derive_policy_status_for_policy(policy, &command_report, None, false);
             let mut report =
                 build_runtime_report(machine_id, policy, status, &command_report, None);
             report.easytier_ipv4 = easytier_ipv4;
