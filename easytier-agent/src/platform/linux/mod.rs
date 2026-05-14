@@ -51,28 +51,27 @@ impl LinuxBackend {
 
         for cidr in &policy.managed_cidrs {
             commands.push(CommandPlan::new(
-                "ip",
+                "sh",
                 [
-                    "rule",
-                    "replace",
-                    "from",
-                    cidr,
-                    "lookup",
-                    &self.table_id.to_string(),
+                    "-c",
+                    &format!(
+                        "ip rule del from {cidr} lookup {table} 2>/dev/null || true; ip rule add from {cidr} lookup {table}",
+                        table = self.table_id
+                    ),
                 ],
             ));
         }
 
         if policy.include_device_traffic {
             commands.push(CommandPlan::new(
-                "ip",
+                "sh",
                 [
-                    "rule",
-                    "replace",
-                    "fwmark",
-                    &self.mark,
-                    "lookup",
-                    &self.table_id.to_string(),
+                    "-c",
+                    &format!(
+                        "ip rule del fwmark {mark} lookup {table} 2>/dev/null || true; ip rule add fwmark {mark} lookup {table}",
+                        mark = self.mark,
+                        table = self.table_id
+                    ),
                 ],
             ));
         }
@@ -229,11 +228,24 @@ mod tests {
                     .args
                     .starts_with(&["route".to_string(), "replace".to_string()])
         }));
-        assert!(commands.iter().any(|cmd| {
+        assert!(!commands.iter().any(|cmd| {
             cmd.program == "ip"
                 && cmd
                     .args
                     .starts_with(&["rule".to_string(), "replace".to_string()])
+        }));
+        let shell_commands = commands
+            .iter()
+            .filter(|cmd| cmd.program == "sh")
+            .map(|cmd| cmd.args.join(" "))
+            .collect::<Vec<_>>();
+        assert!(shell_commands.iter().any(|cmd| {
+            cmd.contains("ip rule del from 192.168.10.0/24 lookup 126 2>/dev/null || true")
+                && cmd.contains("ip rule add from 192.168.10.0/24 lookup 126")
+        }));
+        assert!(shell_commands.iter().any(|cmd| {
+            cmd.contains("ip rule del fwmark 0x7e lookup 126 2>/dev/null || true")
+                && cmd.contains("ip rule add fwmark 0x7e lookup 126")
         }));
     }
 

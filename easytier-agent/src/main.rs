@@ -2,10 +2,9 @@ use std::{fs, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use easytier_agent::{
-    AgentRuntimeReport, CommandExecutionMode, DevicePolicy, PlatformBackend,
-    SystemCommandExecutor, apply_command_plan, build_runtime_report,
-    build_runtime_report_from_failure, derive_policy_status,
-    dry_run_plan, platform::linux::LinuxBackend,
+    AgentRuntimeReport, CommandExecutionMode, DevicePolicy, PlatformBackend, SystemCommandExecutor,
+    apply_command_plan, build_runtime_report, build_runtime_report_from_failure,
+    derive_policy_status, dry_run_plan, platform::linux::LinuxBackend,
 };
 
 #[derive(Debug, Parser)]

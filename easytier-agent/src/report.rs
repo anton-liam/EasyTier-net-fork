@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{CommandExecutionReport, DevicePolicy, PolicyStatus, executor::CommandExecutionFailure};
+use crate::{
+    CommandExecutionReport, DevicePolicy, PolicyStatus, executor::CommandExecutionFailure,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRuntimeReport {
@@ -141,7 +143,10 @@ mod tests {
         let command_report =
             apply_command_plan(commands, CommandExecutionMode::DryRun, &mut executor).unwrap();
 
-        assert_eq!(derive_policy_status(&command_report, None, false), PolicyStatus::Planned);
+        assert_eq!(
+            derive_policy_status(&command_report, None, false),
+            PolicyStatus::Planned
+        );
     }
 
     #[test]
@@ -151,7 +156,10 @@ mod tests {
         let command_report =
             apply_command_plan(commands, CommandExecutionMode::Execute, &mut executor).unwrap();
 
-        assert_eq!(derive_policy_status(&command_report, None, false), PolicyStatus::Active);
+        assert_eq!(
+            derive_policy_status(&command_report, None, false),
+            PolicyStatus::Active
+        );
     }
 
     #[test]
@@ -174,7 +182,10 @@ mod tests {
         let command_report =
             apply_command_plan(commands, CommandExecutionMode::DryRun, &mut executor).unwrap();
 
-        assert_eq!(derive_policy_status(&command_report, None, true), PolicyStatus::Rollbacked);
+        assert_eq!(
+            derive_policy_status(&command_report, None, true),
+            PolicyStatus::Rollbacked
+        );
     }
 
     #[test]
@@ -193,6 +204,9 @@ mod tests {
 
         assert_eq!(report.status, PolicyStatus::Degraded);
         assert_eq!(report.executed_count, 1);
-        assert_eq!(report.last_error.as_deref(), Some("synthetic command failure"));
+        assert_eq!(
+            report.last_error.as_deref(),
+            Some("synthetic command failure")
+        );
     }
 }
