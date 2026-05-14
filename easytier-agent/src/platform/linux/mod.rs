@@ -112,27 +112,22 @@ impl LinuxBackend {
     }
 
     fn exit_apply(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
+        let nft_table = &self.nft_table;
+        let postrouting_chain = format!(
+            "nft list chain inet {nft_table} postrouting >/dev/null 2>&1 || nft add chain inet {nft_table} postrouting '{{ type nat hook postrouting priority srcnat; }}'"
+        );
         let mut commands = vec![
             CommandPlan::new("sysctl", ["-w", "net.ipv4.ip_forward=1"]),
-            CommandPlan::new("nft", ["add", "table", "inet", &self.nft_table]),
             CommandPlan::new(
-                "nft",
+                "sh",
                 [
-                    "add",
-                    "chain",
-                    "inet",
-                    &self.nft_table,
-                    "postrouting",
-                    "{",
-                    "type",
-                    "nat",
-                    "hook",
-                    "postrouting",
-                    "priority",
-                    "srcnat;",
-                    "}",
+                    "-c",
+                    &format!(
+                        "nft list table inet {nft_table} >/dev/null 2>&1 || nft add table inet {nft_table}"
+                    ),
                 ],
             ),
+            CommandPlan::new("sh", ["-c", &postrouting_chain]),
         ];
 
         for cidr in &policy.managed_cidrs {
@@ -158,15 +153,16 @@ impl LinuxBackend {
     }
 
     fn exit_cleanup(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
+        let script = format!(
+            "nft -a list chain inet {} postrouting 2>/dev/null | awk -v comment=\"$1\" '$0 ~ \"comment \\\\\"\" comment \"\\\\\"\" {{ print $NF }}' | while read handle; do nft delete rule inet {} postrouting handle \"$handle\"; done",
+            self.nft_table, self.nft_table
+        );
         vec![CommandPlan::new(
-            "nft",
+            "sh",
             [
-                "delete",
-                "rule",
-                "inet",
-                &self.nft_table,
-                "postrouting",
-                "comment",
+                "-c",
+                &script,
+                "easytier-agent-cleanup",
                 &policy.device_policy_id,
             ],
         )]
@@ -229,11 +225,15 @@ mod tests {
             .unwrap();
         assert!(commands.iter().any(|cmd| {
             cmd.program == "ip"
-                && cmd.args.starts_with(&["route".to_string(), "replace".to_string()])
+                && cmd
+                    .args
+                    .starts_with(&["route".to_string(), "replace".to_string()])
         }));
         assert!(commands.iter().any(|cmd| {
             cmd.program == "ip"
-                && cmd.args.starts_with(&["rule".to_string(), "replace".to_string()])
+                && cmd
+                    .args
+                    .starts_with(&["rule".to_string(), "replace".to_string()])
         }));
     }
 
@@ -244,7 +244,11 @@ mod tests {
             .plan_cleanup(&policy(DevicePolicyRole::ClientGatewayViaPeer))
             .unwrap();
         assert!(commands.iter().all(|cmd| cmd.program == "ip"));
-        assert!(commands.iter().any(|cmd| cmd.args.contains(&"del".to_string())));
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.args.contains(&"del".to_string()))
+        );
     }
 
     #[test]
@@ -260,6 +264,28 @@ mod tests {
     }
 
     #[test]
+    fn exit_apply_prepares_nft_table_and_chain_idempotently() {
+        let backend = LinuxBackend::default();
+        let commands = backend
+            .plan_apply(&policy(DevicePolicyRole::ProvideExitForGateway))
+            .unwrap();
+        let shell_commands = commands
+            .iter()
+            .filter(|cmd| cmd.program == "sh")
+            .map(|cmd| cmd.args.join(" "))
+            .collect::<Vec<_>>();
+
+        assert!(shell_commands.iter().any(|cmd| {
+            cmd.contains("nft list table inet easytier_agent")
+                && cmd.contains("|| nft add table inet easytier_agent")
+        }));
+        assert!(shell_commands.iter().any(|cmd| {
+            cmd.contains("nft list chain inet easytier_agent postrouting")
+                && cmd.contains("|| nft add chain inet easytier_agent postrouting")
+        }));
+    }
+
+    #[test]
     fn exit_cleanup_targets_policy_comment() {
         let backend = LinuxBackend::default();
         let commands = backend
@@ -268,5 +294,22 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert!(commands[0].args.contains(&"p1/source".to_string()));
     }
-}
 
+    #[test]
+    fn exit_cleanup_deletes_nft_rules_by_handle_for_policy_comment() {
+        let backend = LinuxBackend::default();
+        let commands = backend
+            .plan_cleanup(&policy(DevicePolicyRole::ProvideExitForGateway))
+            .unwrap();
+
+        assert_eq!(commands[0].program, "sh");
+        assert!(
+            commands[0]
+                .args
+                .iter()
+                .any(|arg| arg.contains("nft -a list chain"))
+        );
+        assert!(commands[0].args.iter().any(|arg| arg.contains("handle")));
+        assert!(commands[0].args.contains(&"p1/source".to_string()));
+    }
+}

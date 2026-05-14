@@ -51,4 +51,3 @@ mod tests {
         assert_eq!(store.last_known_good().unwrap().policy_id, "p1");
     }
 }
-

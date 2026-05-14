@@ -26,4 +26,3 @@ pub trait PlatformBackend {
 
     fn plan_cleanup(&self, policy: &DevicePolicy) -> anyhow::Result<Vec<CommandPlan>>;
 }
-

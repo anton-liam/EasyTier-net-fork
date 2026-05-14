@@ -142,4 +142,3 @@ mod tests {
         assert!(actions[0].description.contains("10.126.126.2"));
     }
 }
-
