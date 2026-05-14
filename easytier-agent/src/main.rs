@@ -23,15 +23,56 @@ enum Command {
     Apply {
         #[arg(long)]
         policy: PathBuf,
+        #[arg(long, default_value = "localhost")]
+        machine_id: String,
+        #[arg(long)]
+        easytier_ipv4: Option<String>,
         #[arg(long)]
         execute: bool,
     },
     Cleanup {
         #[arg(long)]
         policy: PathBuf,
+        #[arg(long, default_value = "localhost")]
+        machine_id: String,
+        #[arg(long)]
+        easytier_ipv4: Option<String>,
         #[arg(long)]
         execute: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn apply_accepts_machine_identity_for_web_report() {
+        let cli = Cli::parse_from([
+            "easytier-agent",
+            "apply",
+            "--policy",
+            "/tmp/policy.json",
+            "--machine-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--easytier-ipv4",
+            "10.126.126.2",
+        ]);
+
+        let Command::Apply {
+            machine_id,
+            easytier_ipv4,
+            ..
+        } = cli.command
+        else {
+            panic!("expected apply command");
+        };
+
+        assert_eq!(machine_id, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(easytier_ipv4.as_deref(), Some("10.126.126.2"));
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -44,18 +85,28 @@ fn main() -> anyhow::Result<()> {
                 println!("{}: {}", action.kind, action.description);
             }
         }
-        Command::Apply { policy, execute } => {
+        Command::Apply {
+            policy,
+            machine_id,
+            easytier_ipv4,
+            execute,
+        } => {
             let policy = read_policy(policy)?;
             let backend = LinuxBackend::default();
             let commands = backend.plan_apply(&policy)?;
-            let report = run_command_plan("localhost", &policy, commands, execute);
+            let report = run_command_plan(machine_id, easytier_ipv4, &policy, commands, execute);
             println!("{}", serde_json::to_string(&report)?);
         }
-        Command::Cleanup { policy, execute } => {
+        Command::Cleanup {
+            policy,
+            machine_id,
+            easytier_ipv4,
+            execute,
+        } => {
             let policy = read_policy(policy)?;
             let backend = LinuxBackend::default();
             let commands = backend.plan_cleanup(&policy)?;
-            let report = run_command_plan("localhost", &policy, commands, execute);
+            let report = run_command_plan(machine_id, easytier_ipv4, &policy, commands, execute);
             println!("{}", serde_json::to_string(&report)?);
         }
     }
@@ -70,6 +121,7 @@ fn read_policy(path: PathBuf) -> anyhow::Result<DevicePolicy> {
 
 fn run_command_plan(
     machine_id: impl Into<String>,
+    easytier_ipv4: Option<String>,
     policy: &DevicePolicy,
     commands: Vec<easytier_agent::CommandPlan>,
     execute: bool,
@@ -91,14 +143,19 @@ fn run_command_plan(
                 println!("executed_count: {}", command_report.executed_count);
             }
             let status = derive_policy_status(&command_report, None, false);
-            build_runtime_report(machine_id, policy, status, &command_report, None)
+            let mut report =
+                build_runtime_report(machine_id, policy, status, &command_report, None);
+            report.easytier_ipv4 = easytier_ipv4;
+            report
         }
         Err(failure) => {
             for command in &failure.report.commands {
                 println!("{} {}", command.program, command.args.join(" "));
             }
             println!("executed_count: {}", failure.report.executed_count);
-            build_runtime_report_from_failure(machine_id, policy, &failure)
+            let mut report = build_runtime_report_from_failure(machine_id, policy, &failure);
+            report.easytier_ipv4 = easytier_ipv4;
+            report
         }
     }
 }

@@ -8,11 +8,16 @@ use crate::{
 pub struct AgentRuntimeReport {
     pub machine_id: String,
     pub agent_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub easytier_ipv4: Option<String>,
     pub policy_id: String,
     pub device_policy_id: String,
     pub version: u64,
     pub role: String,
     pub status: PolicyStatus,
+    pub observed_policy_id: String,
+    pub observed_policy_version: u64,
+    pub observed_policy_status: PolicyStatus,
     pub dry_run: bool,
     pub executed_count: usize,
     pub last_error: Option<String>,
@@ -28,11 +33,15 @@ pub fn build_runtime_report(
     AgentRuntimeReport {
         machine_id: machine_id.into(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        easytier_ipv4: None,
         policy_id: policy.policy_id.clone(),
         device_policy_id: policy.device_policy_id.clone(),
         version: policy.version,
         role: policy.role.to_string(),
         status,
+        observed_policy_id: policy.policy_id.clone(),
+        observed_policy_version: policy.version,
+        observed_policy_status: status,
         dry_run: command_report.dry_run,
         executed_count: command_report.executed_count,
         last_error,
@@ -134,6 +143,28 @@ mod tests {
         assert!(report.dry_run);
         assert_eq!(report.executed_count, 0);
         assert_eq!(report.status, PolicyStatus::Active);
+    }
+
+    #[test]
+    fn serializes_web_observed_state_fields() {
+        let policy = policy();
+        let commands = vec![CommandPlan::new("ip", ["route", "show", "default"])];
+        let mut executor = NoopExecutor;
+        let command_report =
+            apply_command_plan(commands, CommandExecutionMode::Execute, &mut executor).unwrap();
+
+        let report = build_runtime_report(
+            "00000000-0000-0000-0000-000000000001",
+            &policy,
+            PolicyStatus::Active,
+            &command_report,
+            None,
+        );
+        let json = serde_json::to_value(report).unwrap();
+
+        assert_eq!(json["observed_policy_id"], "p1");
+        assert_eq!(json["observed_policy_version"], 2);
+        assert_eq!(json["observed_policy_status"], "active");
     }
 
     #[test]
