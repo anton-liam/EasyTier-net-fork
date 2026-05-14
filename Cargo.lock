@@ -485,7 +485,11 @@ dependencies = [
  "base64 0.22.1",
  "http",
  "log",
+ "rustls",
+ "serde",
+ "serde_json",
  "url",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
@@ -2384,6 +2388,7 @@ name = "easytier-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "attohttpc",
  "clap",
  "serde",
  "serde_json",

@@ -2,9 +2,10 @@ use std::{fs, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use easytier_agent::{
-    AgentRuntimeReport, CommandExecutionMode, DevicePolicy, PlatformBackend, SystemCommandExecutor,
-    apply_command_plan, build_runtime_report, build_runtime_report_from_failure,
-    derive_policy_status, dry_run_plan, platform::linux::LinuxBackend,
+    AgentRuntimeReport, CommandExecutionMode, DevicePolicy, PlatformBackend, ReportTarget,
+    SystemCommandExecutor, apply_command_plan, build_runtime_report,
+    build_runtime_report_from_failure, derive_policy_status, dry_run_plan,
+    platform::linux::LinuxBackend, post_runtime_report,
 };
 
 #[derive(Debug, Parser)]
@@ -28,6 +29,12 @@ enum Command {
         #[arg(long)]
         easytier_ipv4: Option<String>,
         #[arg(long)]
+        web_base_url: Option<String>,
+        #[arg(long)]
+        user_id: Option<i32>,
+        #[arg(long)]
+        internal_auth_token: Option<String>,
+        #[arg(long)]
         execute: bool,
     },
     Cleanup {
@@ -37,6 +44,12 @@ enum Command {
         machine_id: String,
         #[arg(long)]
         easytier_ipv4: Option<String>,
+        #[arg(long)]
+        web_base_url: Option<String>,
+        #[arg(long)]
+        user_id: Option<i32>,
+        #[arg(long)]
+        internal_auth_token: Option<String>,
         #[arg(long)]
         execute: bool,
     },
@@ -64,6 +77,9 @@ mod tests {
         let Command::Apply {
             machine_id,
             easytier_ipv4,
+            web_base_url,
+            user_id,
+            internal_auth_token,
             ..
         } = cli.command
         else {
@@ -72,6 +88,22 @@ mod tests {
 
         assert_eq!(machine_id, "00000000-0000-0000-0000-000000000001");
         assert_eq!(easytier_ipv4.as_deref(), Some("10.126.126.2"));
+        assert!(web_base_url.is_none());
+        assert!(user_id.is_none());
+        assert!(internal_auth_token.is_none());
+    }
+
+    #[test]
+    fn report_target_requires_all_web_report_flags() {
+        let err = super::report_target_from_flags(
+            Some("http://127.0.0.1:11211".to_string()),
+            None,
+            Some("secret".to_string()),
+            "00000000-0000-0000-0000-000000000001".to_string(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("all web report flags"));
     }
 }
 
@@ -89,24 +121,48 @@ fn main() -> anyhow::Result<()> {
             policy,
             machine_id,
             easytier_ipv4,
+            web_base_url,
+            user_id,
+            internal_auth_token,
             execute,
         } => {
             let policy = read_policy(policy)?;
             let backend = LinuxBackend::default();
             let commands = backend.plan_apply(&policy)?;
+            let report_target = report_target_from_flags(
+                web_base_url,
+                user_id,
+                internal_auth_token,
+                machine_id.clone(),
+            )?;
             let report = run_command_plan(machine_id, easytier_ipv4, &policy, commands, execute);
+            if let Some(target) = report_target {
+                post_runtime_report(&target, &report)?;
+            }
             println!("{}", serde_json::to_string(&report)?);
         }
         Command::Cleanup {
             policy,
             machine_id,
             easytier_ipv4,
+            web_base_url,
+            user_id,
+            internal_auth_token,
             execute,
         } => {
             let policy = read_policy(policy)?;
             let backend = LinuxBackend::default();
             let commands = backend.plan_cleanup(&policy)?;
+            let report_target = report_target_from_flags(
+                web_base_url,
+                user_id,
+                internal_auth_token,
+                machine_id.clone(),
+            )?;
             let report = run_command_plan(machine_id, easytier_ipv4, &policy, commands, execute);
+            if let Some(target) = report_target {
+                post_runtime_report(&target, &report)?;
+            }
             println!("{}", serde_json::to_string(&report)?);
         }
     }
@@ -117,6 +173,26 @@ fn main() -> anyhow::Result<()> {
 fn read_policy(path: PathBuf) -> anyhow::Result<DevicePolicy> {
     let raw = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&raw)?)
+}
+
+fn report_target_from_flags(
+    web_base_url: Option<String>,
+    user_id: Option<i32>,
+    internal_auth_token: Option<String>,
+    machine_id: String,
+) -> anyhow::Result<Option<ReportTarget>> {
+    match (web_base_url, user_id, internal_auth_token) {
+        (None, None, None) => Ok(None),
+        (Some(web_base_url), Some(user_id), Some(internal_auth_token)) => Ok(Some(ReportTarget {
+            web_base_url,
+            user_id,
+            machine_id,
+            internal_auth_token,
+        })),
+        _ => anyhow::bail!(
+            "all web report flags are required together: --web-base-url, --user-id, --internal-auth-token"
+        ),
+    }
 }
 
 fn run_command_plan(
