@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { Button, Card, Column, DataTable, Drawer, ProgressSpinner, Tag, useToast } from 'primevue';
 import { Utils } from 'easytier-frontend-lib';
-import ApiClient, { type GatewayPolicySnapshot } from '../modules/api';
+import ApiClient, { type GatewayFullTunnelPolicy, type GatewayPolicySnapshot } from '../modules/api';
 import GatewayPolicyEditor from './GatewayPolicyEditor.vue';
 
 const props = defineProps<{ api?: ApiClient }>();
@@ -55,6 +55,24 @@ const openCreate = () => {
 const openEdit = (policy: GatewayPolicySnapshot) => {
     editingPolicy.value = policy;
     editorVisible.value = true;
+};
+
+const clonePolicyWith = (policy: GatewayPolicySnapshot, patch: Partial<GatewayFullTunnelPolicy>): GatewayFullTunnelPolicy => ({
+    ...policy.desired,
+    ...patch,
+    desired_version: policy.desired.desired_version + 1,
+});
+
+const setPolicyEnabled = async (policy: GatewayPolicySnapshot, enabled: boolean) => {
+    if (!props.api) return;
+    if (enabled && !window.confirm('启用策略会改变目标节点的 desired state，实际流量切换结果以 observed 状态为准。确认启用？')) return;
+    await props.api.upsert_gateway_policy(clonePolicyWith(policy, { enabled }));
+    await reloadAll();
+};
+
+const confirmEdit = (policy: GatewayPolicySnapshot) => {
+    if (policy.desired.enabled && !window.confirm('编辑已启用策略可能触发出口切换。Web 只修改 desired state，是否完成请以 observed source/exit 状态为准。确认继续？')) return;
+    openEdit(policy);
 };
 
 const openDetails = (policy: GatewayPolicySnapshot) => {
@@ -128,7 +146,13 @@ onUnmounted(() => periodFunc.stop());
                         <template #body="slotProps">
                             <div class="flex items-center gap-2">
                                 <Button icon="pi pi-eye" severity="secondary" rounded @click="openDetails(slotProps.data)" />
-                                <Button icon="pi pi-pencil" severity="secondary" rounded @click="openEdit(slotProps.data)" />
+                                <Button icon="pi pi-pencil" severity="secondary" rounded @click="confirmEdit(slotProps.data)" />
+                                <Button
+                                    :icon="slotProps.data.desired.enabled ? 'pi pi-pause' : 'pi pi-play'"
+                                    :severity="slotProps.data.desired.enabled ? 'warn' : 'success'"
+                                    rounded
+                                    @click="setPolicyEnabled(slotProps.data, !slotProps.data.desired.enabled)"
+                                />
                             </div>
                         </template>
                     </Column>
