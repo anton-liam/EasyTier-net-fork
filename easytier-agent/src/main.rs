@@ -3,10 +3,10 @@ use std::{fs, path::PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use easytier_agent::{
     AgentRuntimeReport, CommandExecutionMode, CommandPlan, ControlPlaneEndpoint, ControlPlaneGuard,
-    DevicePolicy, PlatformBackend, ReportTarget, SystemCommandExecutor, apply_command_plan,
-    build_runtime_report, build_runtime_report_from_failure, derive_policy_status_for_policy,
-    dry_run_plan, platform::linux::LinuxBackend, platform::openwrt::OpenWrtBackend,
-    post_runtime_report,
+    DevicePolicy, PlatformBackend, PolicyReconciler, ReportTarget, SystemCommandExecutor,
+    apply_command_plan, build_runtime_report, build_runtime_report_from_failure,
+    derive_policy_status_for_policy, dry_run_plan, fetch_device_policies,
+    platform::linux::LinuxBackend, platform::openwrt::OpenWrtBackend, post_runtime_report,
 };
 
 #[derive(Debug, Parser)]
@@ -55,6 +55,22 @@ enum Command {
         user_id: Option<i32>,
         #[arg(long)]
         internal_auth_token: Option<String>,
+        #[arg(long)]
+        execute: bool,
+    },
+    RunOnce {
+        #[arg(long, value_enum, default_value_t = PlatformKind::Linux)]
+        platform: PlatformKind,
+        #[arg(long)]
+        web_base_url: String,
+        #[arg(long)]
+        user_id: i32,
+        #[arg(long)]
+        machine_id: String,
+        #[arg(long)]
+        internal_auth_token: String,
+        #[arg(long)]
+        easytier_ipv4: Option<String>,
         #[arg(long)]
         execute: bool,
     },
@@ -216,6 +232,45 @@ mod tests {
         );
         assert!(!commands.iter().any(|cmd| cmd.program == "nft"));
     }
+
+    #[test]
+    fn run_once_requires_web_identity_flags() {
+        let cli = Cli::parse_from([
+            "easytier-agent",
+            "run-once",
+            "--web-base-url",
+            "http://127.0.0.1:11211",
+            "--user-id",
+            "1",
+            "--machine-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--internal-auth-token",
+            "secret",
+            "--platform",
+            "open-wrt",
+        ]);
+
+        let Command::RunOnce {
+            platform,
+            web_base_url,
+            user_id,
+            machine_id,
+            internal_auth_token,
+            ..
+        } = cli.command
+        else {
+            panic!("expected run-once command");
+        };
+
+        assert_eq!(platform, PlatformKind::OpenWrt);
+        assert_eq!(web_base_url, "http://127.0.0.1:11211");
+        assert_eq!(user_id, 1);
+        assert_eq!(
+            machine_id,
+            "00000000-0000-0000-0000-000000000001".to_string()
+        );
+        assert_eq!(internal_auth_token, "secret");
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -276,8 +331,52 @@ fn main() -> anyhow::Result<()> {
             }
             println!("{}", serde_json::to_string(&report)?);
         }
+        Command::RunOnce {
+            platform,
+            web_base_url,
+            user_id,
+            machine_id,
+            internal_auth_token,
+            easytier_ipv4,
+            execute,
+        } => {
+            let target = ReportTarget {
+                web_base_url: web_base_url.clone(),
+                user_id,
+                machine_id: machine_id.clone(),
+                internal_auth_token,
+            };
+            run_once(target, platform, easytier_ipv4, execute)?;
+        }
     }
 
+    Ok(())
+}
+
+fn run_once(
+    target: ReportTarget,
+    platform: PlatformKind,
+    easytier_ipv4: Option<String>,
+    execute: bool,
+) -> anyhow::Result<()> {
+    let policies = fetch_device_policies(&target)?;
+    let mut reconciler = PolicyReconciler::default();
+    for event in reconciler.reconcile(&policies)? {
+        println!("reconcile: {event:?}");
+    }
+    for policy in policies {
+        let commands =
+            apply_commands_for_policy(&policy, Some(target.web_base_url.clone()), platform)?;
+        let report = run_command_plan(
+            target.machine_id.clone(),
+            easytier_ipv4.clone(),
+            &policy,
+            commands,
+            execute,
+        );
+        post_runtime_report(&target, &report)?;
+        println!("{}", serde_json::to_string(&report)?);
+    }
     Ok(())
 }
 
