@@ -3,13 +3,17 @@ import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { Button, Card, Column, DataTable, Drawer, ProgressSpinner, Tag, useToast } from 'primevue';
 import { Utils } from 'easytier-frontend-lib';
 import ApiClient, { type GatewayPolicySnapshot } from '../modules/api';
+import GatewayPolicyEditor from './GatewayPolicyEditor.vue';
 
 const props = defineProps<{ api?: ApiClient }>();
 const toast = useToast();
 
 const policies = ref<GatewayPolicySnapshot[] | undefined>(undefined);
+const devices = ref<Utils.DeviceInfo[]>([]);
 const selectedPolicy = ref<GatewayPolicySnapshot | null>(null);
 const detailVisible = ref(false);
+const editorVisible = ref(false);
+const editingPolicy = ref<GatewayPolicySnapshot | null>(null);
 const loading = computed(() => policies.value === undefined);
 
 const statusSeverity = (status?: string | null) => {
@@ -23,9 +27,34 @@ const statusSeverity = (status?: string | null) => {
 const boolLabel = (value: boolean) => value ? '是' : '否';
 const shortId = (value?: string | null) => value ? value.slice(0, 8) : '-';
 
+const deviceOptions = computed(() => devices.value.map((device) => ({
+    label: `${device.hostname || 'unknown'} (${shortId(device.machine_id)})`,
+    value: device.machine_id,
+    networkIds: device.running_network_instances || [],
+})).filter((device) => !!device.value));
+
 const loadPolicies = async () => {
     if (!props.api) return;
     policies.value = await props.api.list_gateway_policies();
+};
+
+const loadDevices = async () => {
+    if (!props.api) return;
+    devices.value = (await props.api.list_machines()).map((machine) => Utils.buildDeviceInfo(machine));
+};
+
+const reloadAll = async () => {
+    await Promise.all([loadPolicies(), loadDevices()]);
+};
+
+const openCreate = () => {
+    editingPolicy.value = null;
+    editorVisible.value = true;
+};
+
+const openEdit = (policy: GatewayPolicySnapshot) => {
+    editingPolicy.value = policy;
+    editorVisible.value = true;
 };
 
 const openDetails = (policy: GatewayPolicySnapshot) => {
@@ -35,7 +64,7 @@ const openDetails = (policy: GatewayPolicySnapshot) => {
 
 const periodFunc = new Utils.PeriodicTask(async () => {
     try {
-        await loadPolicies();
+        await reloadAll();
     } catch (e) {
         toast.add({ severity: 'error', summary: '加载出口策略失败', detail: String(e), life: 2000 });
         console.error(e);
@@ -53,7 +82,10 @@ onUnmounted(() => periodFunc.stop());
                 <h1 class="text-xl font-semibold text-gray-900 dark:text-gray-100">出口策略</h1>
                 <p class="text-sm text-gray-500 dark:text-gray-400">查看 source R3S 到 exit R3S 的全流量转发策略和 Agent 实际上报状态。</p>
             </div>
-            <Button icon="pi pi-refresh" severity="secondary" rounded @click="loadPolicies" />
+            <div class="flex items-center gap-2">
+                <Button icon="pi pi-refresh" severity="secondary" rounded @click="reloadAll" />
+                <Button icon="pi pi-plus" label="创建策略" @click="openCreate" />
+            </div>
         </div>
 
         <Card>
@@ -94,7 +126,10 @@ onUnmounted(() => periodFunc.stop());
                     </Column>
                     <Column header="操作">
                         <template #body="slotProps">
-                            <Button icon="pi pi-eye" severity="secondary" rounded @click="openDetails(slotProps.data)" />
+                            <div class="flex items-center gap-2">
+                                <Button icon="pi pi-eye" severity="secondary" rounded @click="openDetails(slotProps.data)" />
+                                <Button icon="pi pi-pencil" severity="secondary" rounded @click="openEdit(slotProps.data)" />
+                            </div>
                         </template>
                     </Column>
                 </DataTable>
@@ -124,5 +159,13 @@ onUnmounted(() => periodFunc.stop());
                 </section>
             </div>
         </Drawer>
+
+        <GatewayPolicyEditor
+            v-model:visible="editorVisible"
+            :api="api"
+            :devices="deviceOptions"
+            :policy="editingPolicy"
+            @saved="reloadAll"
+        />
     </div>
 </template>
