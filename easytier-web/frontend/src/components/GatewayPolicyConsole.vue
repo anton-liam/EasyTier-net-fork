@@ -1,0 +1,92 @@
+<script setup lang="ts">
+import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { Button, Card, Column, DataTable, ProgressSpinner, Tag, useToast } from 'primevue';
+import { Utils } from 'easytier-frontend-lib';
+import ApiClient, { type GatewayPolicySnapshot } from '../modules/api';
+
+const props = defineProps<{ api?: ApiClient }>();
+const toast = useToast();
+
+const policies = ref<GatewayPolicySnapshot[] | undefined>(undefined);
+const loading = computed(() => policies.value === undefined);
+
+const statusSeverity = (status?: string | null) => {
+    if (!status) return 'secondary';
+    if (status === 'active' || status === 'prepared') return 'success';
+    if (status === 'degraded' || status === 'rollbacked') return 'warn';
+    if (status === 'rollbacking') return 'danger';
+    return 'info';
+};
+
+const boolLabel = (value: boolean) => value ? '是' : '否';
+const shortId = (value?: string | null) => value ? value.slice(0, 8) : '-';
+
+const loadPolicies = async () => {
+    if (!props.api) return;
+    policies.value = await props.api.list_gateway_policies();
+};
+
+const periodFunc = new Utils.PeriodicTask(async () => {
+    try {
+        await loadPolicies();
+    } catch (e) {
+        toast.add({ severity: 'error', summary: '加载出口策略失败', detail: String(e), life: 2000 });
+        console.error(e);
+    }
+}, 1500);
+
+onMounted(() => periodFunc.start());
+onUnmounted(() => periodFunc.stop());
+</script>
+
+<template>
+    <div class="space-y-4">
+        <div class="flex items-center justify-between gap-3">
+            <div>
+                <h1 class="text-xl font-semibold text-gray-900 dark:text-gray-100">出口策略</h1>
+                <p class="text-sm text-gray-500 dark:text-gray-400">查看 source R3S 到 exit R3S 的全流量转发策略和 Agent 实际上报状态。</p>
+            </div>
+            <Button icon="pi pi-refresh" severity="secondary" rounded @click="loadPolicies" />
+        </div>
+
+        <Card>
+            <template #content>
+                <div v-if="loading" class="w-full flex justify-center py-8">
+                    <ProgressSpinner />
+                </div>
+                <DataTable v-else :value="policies" dataKey="desired.policy_id" stripedRows responsiveLayout="scroll">
+                    <Column header="启用">
+                        <template #body="slotProps">
+                            <Tag :severity="slotProps.data.desired.enabled ? 'success' : 'secondary'" :value="slotProps.data.desired.enabled ? '启用' : '停用'" />
+                        </template>
+                    </Column>
+                    <Column header="Source">
+                        <template #body="slotProps">{{ shortId(slotProps.data.desired.source_machine_id) }}</template>
+                    </Column>
+                    <Column header="Exit">
+                        <template #body="slotProps">{{ shortId(slotProps.data.desired.exit_machine_id) }}</template>
+                    </Column>
+                    <Column header="受管网段">
+                        <template #body="slotProps">{{ slotProps.data.desired.managed_cidrs.join(', ') || '-' }}</template>
+                    </Column>
+                    <Column header="设备流量">
+                        <template #body="slotProps">{{ boolLabel(slotProps.data.desired.include_device_traffic) }}</template>
+                    </Column>
+                    <Column header="Source 状态">
+                        <template #body="slotProps">
+                            <Tag :severity="statusSeverity(slotProps.data.observed.source?.status)" :value="slotProps.data.observed.source?.status || 'unknown'" />
+                        </template>
+                    </Column>
+                    <Column header="Exit 状态">
+                        <template #body="slotProps">
+                            <Tag :severity="statusSeverity(slotProps.data.observed.exit?.status)" :value="slotProps.data.observed.exit?.status || 'unknown'" />
+                        </template>
+                    </Column>
+                    <Column header="版本">
+                        <template #body="slotProps">{{ slotProps.data.desired.desired_version }}</template>
+                    </Column>
+                </DataTable>
+            </template>
+        </Card>
+    </div>
+</template>
