@@ -1,11 +1,12 @@
 use std::{fs, path::PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use easytier_agent::{
     AgentRuntimeReport, CommandExecutionMode, CommandPlan, ControlPlaneEndpoint, ControlPlaneGuard,
     DevicePolicy, PlatformBackend, ReportTarget, SystemCommandExecutor, apply_command_plan,
     build_runtime_report, build_runtime_report_from_failure, derive_policy_status_for_policy,
-    dry_run_plan, platform::linux::LinuxBackend, post_runtime_report,
+    dry_run_plan, platform::linux::LinuxBackend, platform::openwrt::OpenWrtBackend,
+    post_runtime_report,
 };
 
 #[derive(Debug, Parser)]
@@ -24,6 +25,8 @@ enum Command {
     Apply {
         #[arg(long)]
         policy: PathBuf,
+        #[arg(long, value_enum, default_value_t = PlatformKind::Linux)]
+        platform: PlatformKind,
         #[arg(long, default_value = "localhost")]
         machine_id: String,
         #[arg(long)]
@@ -40,6 +43,8 @@ enum Command {
     Cleanup {
         #[arg(long)]
         policy: PathBuf,
+        #[arg(long, value_enum, default_value_t = PlatformKind::Linux)]
+        platform: PlatformKind,
         #[arg(long, default_value = "localhost")]
         machine_id: String,
         #[arg(long)]
@@ -55,11 +60,17 @@ enum Command {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PlatformKind {
+    Linux,
+    OpenWrt,
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, PlatformKind};
 
     #[test]
     fn apply_accepts_machine_identity_for_web_report() {
@@ -107,6 +118,24 @@ mod tests {
     }
 
     #[test]
+    fn apply_accepts_openwrt_platform() {
+        let cli = Cli::parse_from([
+            "easytier-agent",
+            "apply",
+            "--policy",
+            "/tmp/policy.json",
+            "--platform",
+            "open-wrt",
+        ]);
+
+        let Command::Apply { platform, .. } = cli.command else {
+            panic!("expected apply command");
+        };
+
+        assert_eq!(platform, PlatformKind::OpenWrt);
+    }
+
+    #[test]
     fn apply_plan_protects_web_control_plane_before_gateway_rules() {
         let policy: easytier_agent::DevicePolicy = serde_json::from_str(&format!(
             r#"{{
@@ -131,6 +160,7 @@ mod tests {
         let commands = super::apply_commands_for_policy(
             &policy,
             Some("http://192.168.64.4:11211".to_string()),
+            PlatformKind::Linux,
         )
         .unwrap();
 
@@ -155,6 +185,37 @@ mod tests {
                     .starts_with(&["route".to_string(), "replace".to_string()])
         }));
     }
+
+    #[test]
+    fn openwrt_apply_plan_uses_fw4_backend() {
+        let policy: easytier_agent::DevicePolicy = serde_json::from_str(&format!(
+            r#"{{
+              "policy_id": "p1",
+              "device_policy_id": "p1/exit",
+              "version": 1,
+              "role": "provide_exit_for_gateway",
+              "network_instance_id": "{}",
+              "source_machine_id": "node-a",
+              "managed_cidrs": ["192.168.10.0/24"],
+              "exit_machine_id": "node-b",
+              "source_peer_ipv4": "10.126.126.2",
+              "protect_control_plane": true,
+              "rollback_enabled": true
+            }}"#,
+            uuid::Uuid::nil()
+        ))
+        .unwrap();
+
+        let commands =
+            super::apply_commands_for_policy(&policy, None, PlatformKind::OpenWrt).unwrap();
+
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.program == "fw4" && cmd.args == ["reload"])
+        );
+        assert!(!commands.iter().any(|cmd| cmd.program == "nft"));
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -175,9 +236,10 @@ fn main() -> anyhow::Result<()> {
             user_id,
             internal_auth_token,
             execute,
+            platform,
         } => {
             let policy = read_policy(policy)?;
-            let commands = apply_commands_for_policy(&policy, web_base_url.clone())?;
+            let commands = apply_commands_for_policy(&policy, web_base_url.clone(), platform)?;
             let report_target = report_target_from_flags(
                 web_base_url,
                 user_id,
@@ -198,10 +260,10 @@ fn main() -> anyhow::Result<()> {
             user_id,
             internal_auth_token,
             execute,
+            platform,
         } => {
             let policy = read_policy(policy)?;
-            let backend = LinuxBackend::default();
-            let commands = backend.plan_cleanup(&policy)?;
+            let commands = cleanup_commands_for_policy(&policy, platform)?;
             let report_target = report_target_from_flags(
                 web_base_url,
                 user_id,
@@ -247,16 +309,17 @@ fn report_target_from_flags(
 fn apply_commands_for_policy(
     policy: &DevicePolicy,
     web_base_url: Option<String>,
+    platform: PlatformKind,
 ) -> anyhow::Result<Vec<CommandPlan>> {
-    let backend = LinuxBackend::default();
-    let mut commands = control_plane_commands(policy, web_base_url)?;
-    commands.extend(backend.plan_apply(policy)?);
+    let mut commands = control_plane_commands(policy, web_base_url, platform)?;
+    commands.extend(plan_apply_for_platform(policy, platform)?);
     Ok(commands)
 }
 
 fn control_plane_commands(
     policy: &DevicePolicy,
     web_base_url: Option<String>,
+    platform: PlatformKind,
 ) -> anyhow::Result<Vec<CommandPlan>> {
     if !policy.protect_control_plane {
         return Ok(Vec::new());
@@ -267,11 +330,39 @@ fn control_plane_commands(
     let Some(host) = host_from_url_like(&web_base_url) else {
         anyhow::bail!("invalid --web-base-url: missing host");
     };
-    let backend = LinuxBackend::default();
     Ok(
         ControlPlaneGuard::new(vec![ControlPlaneEndpoint::new("web", host)])
-            .protected_route_plan_for_table(Some(backend.table_id())),
+            .protected_route_plan_for_table(Some(platform.table_id())),
     )
+}
+
+fn plan_apply_for_platform(
+    policy: &DevicePolicy,
+    platform: PlatformKind,
+) -> anyhow::Result<Vec<CommandPlan>> {
+    match platform {
+        PlatformKind::Linux => LinuxBackend::default().plan_apply(policy),
+        PlatformKind::OpenWrt => OpenWrtBackend::default().plan_apply(policy),
+    }
+}
+
+fn cleanup_commands_for_policy(
+    policy: &DevicePolicy,
+    platform: PlatformKind,
+) -> anyhow::Result<Vec<CommandPlan>> {
+    match platform {
+        PlatformKind::Linux => LinuxBackend::default().plan_cleanup(policy),
+        PlatformKind::OpenWrt => OpenWrtBackend::default().plan_cleanup(policy),
+    }
+}
+
+impl PlatformKind {
+    fn table_id(self) -> u32 {
+        match self {
+            PlatformKind::Linux => LinuxBackend::default().table_id(),
+            PlatformKind::OpenWrt => 126,
+        }
+    }
 }
 
 fn host_from_url_like(value: &str) -> Option<String> {
