@@ -26,6 +26,11 @@ const statusSeverity = (status?: string | null) => {
 
 const boolLabel = (value: boolean) => value ? '是' : '否';
 const shortId = (value?: string | null) => value ? value.slice(0, 8) : '-';
+const lastError = (policy: GatewayPolicySnapshot) => policy.observed.source?.last_error || policy.observed.exit?.last_error || '';
+const versionAligned = (policy: GatewayPolicySnapshot) => {
+    const desired = policy.desired.desired_version;
+    return policy.observed.source?.version === desired && policy.observed.exit?.version === desired;
+};
 
 const deviceOptions = computed(() => devices.value.map((device) => ({
     label: `${device.hostname || 'unknown'} (${shortId(device.machine_id)})`,
@@ -111,6 +116,10 @@ onUnmounted(() => periodFunc.stop());
                 <div v-if="loading" class="w-full flex justify-center py-8">
                     <ProgressSpinner />
                 </div>
+                <div v-else-if="policies?.length === 0" class="py-10 text-center text-gray-500">
+                    <div class="text-base font-medium">还没有出口策略</div>
+                    <div class="text-sm mt-1">创建一条策略后，可以把任意 source R3S 的受管流量切到任意 exit R3S。</div>
+                </div>
                 <DataTable v-else :value="policies" dataKey="desired.policy_id" stripedRows responsiveLayout="scroll">
                     <Column header="启用">
                         <template #body="slotProps">
@@ -140,7 +149,14 @@ onUnmounted(() => periodFunc.stop());
                         </template>
                     </Column>
                     <Column header="版本">
-                        <template #body="slotProps">{{ slotProps.data.desired.desired_version }}</template>
+                        <template #body="slotProps">
+                            <Tag :severity="versionAligned(slotProps.data) ? 'success' : 'warn'" :value="slotProps.data.desired.desired_version" />
+                        </template>
+                    </Column>
+                    <Column header="最近错误">
+                        <template #body="slotProps">
+                            <span class="text-sm text-red-600 break-all">{{ lastError(slotProps.data) || '-' }}</span>
+                        </template>
                     </Column>
                     <Column header="操作">
                         <template #body="slotProps">
