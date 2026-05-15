@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue';
-import { Button, Card, Column, DataTable, ProgressSpinner, Tag, useToast } from 'primevue';
+import { Button, Card, Column, DataTable, Drawer, ProgressSpinner, Tag, useToast } from 'primevue';
 import { Utils } from 'easytier-frontend-lib';
 import ApiClient, { type GatewayPolicySnapshot } from '../modules/api';
 
@@ -8,6 +8,8 @@ const props = defineProps<{ api?: ApiClient }>();
 const toast = useToast();
 
 const policies = ref<GatewayPolicySnapshot[] | undefined>(undefined);
+const selectedPolicy = ref<GatewayPolicySnapshot | null>(null);
+const detailVisible = ref(false);
 const loading = computed(() => policies.value === undefined);
 
 const statusSeverity = (status?: string | null) => {
@@ -24,6 +26,11 @@ const shortId = (value?: string | null) => value ? value.slice(0, 8) : '-';
 const loadPolicies = async () => {
     if (!props.api) return;
     policies.value = await props.api.list_gateway_policies();
+};
+
+const openDetails = (policy: GatewayPolicySnapshot) => {
+    selectedPolicy.value = policy;
+    detailVisible.value = true;
 };
 
 const periodFunc = new Utils.PeriodicTask(async () => {
@@ -85,8 +92,37 @@ onUnmounted(() => periodFunc.stop());
                     <Column header="版本">
                         <template #body="slotProps">{{ slotProps.data.desired.desired_version }}</template>
                     </Column>
+                    <Column header="操作">
+                        <template #body="slotProps">
+                            <Button icon="pi pi-eye" severity="secondary" rounded @click="openDetails(slotProps.data)" />
+                        </template>
+                    </Column>
                 </DataTable>
             </template>
         </Card>
+
+        <Drawer v-model:visible="detailVisible" position="right" class="w-full md:w-2/5" header="策略详情">
+            <div v-if="selectedPolicy" class="space-y-4 text-sm">
+                <section>
+                    <h2 class="font-semibold mb-2">Desired</h2>
+                    <dl class="grid grid-cols-1 gap-2">
+                        <div><dt class="text-gray-500">Policy ID</dt><dd class="font-mono break-all">{{ selectedPolicy.desired.policy_id }}</dd></div>
+                        <div><dt class="text-gray-500">Source</dt><dd class="font-mono break-all">{{ selectedPolicy.desired.source_machine_id }}</dd></div>
+                        <div><dt class="text-gray-500">Exit</dt><dd class="font-mono break-all">{{ selectedPolicy.desired.exit_machine_id }}</dd></div>
+                        <div><dt class="text-gray-500">Network Instance</dt><dd class="font-mono break-all">{{ selectedPolicy.desired.network_instance_id }}</dd></div>
+                        <div><dt class="text-gray-500">Ingress Ifaces</dt><dd>{{ selectedPolicy.desired.ingress_ifaces.join(', ') || 'auto' }}</dd></div>
+                        <div><dt class="text-gray-500">Exit Egress</dt><dd>{{ selectedPolicy.desired.exit_egress.mode }} {{ selectedPolicy.desired.exit_egress.iface || '' }}</dd></div>
+                    </dl>
+                </section>
+                <section>
+                    <h2 class="font-semibold mb-2">Observed Source</h2>
+                    <pre class="text-xs overflow-auto bg-gray-50 dark:bg-gray-900 p-3 rounded">{{ JSON.stringify(selectedPolicy.observed.source, null, 2) }}</pre>
+                </section>
+                <section>
+                    <h2 class="font-semibold mb-2">Observed Exit</h2>
+                    <pre class="text-xs overflow-auto bg-gray-50 dark:bg-gray-900 p-3 rounded">{{ JSON.stringify(selectedPolicy.observed.exit, null, 2) }}</pre>
+                </section>
+            </div>
+        </Drawer>
     </div>
 </template>
