@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, thread, time::Duration};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use easytier_agent::{
@@ -71,6 +71,24 @@ enum Command {
         internal_auth_token: String,
         #[arg(long)]
         easytier_ipv4: Option<String>,
+        #[arg(long)]
+        execute: bool,
+    },
+    Run {
+        #[arg(long, value_enum, default_value_t = PlatformKind::Linux)]
+        platform: PlatformKind,
+        #[arg(long)]
+        web_base_url: String,
+        #[arg(long)]
+        user_id: i32,
+        #[arg(long)]
+        machine_id: String,
+        #[arg(long)]
+        internal_auth_token: String,
+        #[arg(long)]
+        easytier_ipv4: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        interval_seconds: u64,
         #[arg(long)]
         execute: bool,
     },
@@ -271,6 +289,40 @@ mod tests {
         );
         assert_eq!(internal_auth_token, "secret");
     }
+
+    #[test]
+    fn run_accepts_interval_and_web_identity_flags() {
+        let cli = Cli::parse_from([
+            "easytier-agent",
+            "run",
+            "--web-base-url",
+            "http://127.0.0.1:11211",
+            "--user-id",
+            "1",
+            "--machine-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--internal-auth-token",
+            "secret",
+            "--interval-seconds",
+            "3",
+            "--platform",
+            "open-wrt",
+        ]);
+
+        let Command::Run {
+            platform,
+            interval_seconds,
+            web_base_url,
+            ..
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(platform, PlatformKind::OpenWrt);
+        assert_eq!(interval_seconds, 3);
+        assert_eq!(web_base_url, "http://127.0.0.1:11211");
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -348,8 +400,88 @@ fn main() -> anyhow::Result<()> {
             };
             run_once(target, platform, easytier_ipv4, execute)?;
         }
+        Command::Run {
+            platform,
+            web_base_url,
+            user_id,
+            machine_id,
+            internal_auth_token,
+            easytier_ipv4,
+            interval_seconds,
+            execute,
+        } => {
+            let target = ReportTarget {
+                web_base_url: web_base_url.clone(),
+                user_id,
+                machine_id: machine_id.clone(),
+                internal_auth_token,
+            };
+            run_loop(
+                target,
+                platform,
+                easytier_ipv4,
+                execute,
+                Duration::from_secs(interval_seconds),
+                None,
+            )?;
+        }
     }
 
+    Ok(())
+}
+
+fn run_loop(
+    target: ReportTarget,
+    platform: PlatformKind,
+    easytier_ipv4: Option<String>,
+    execute: bool,
+    interval: Duration,
+    max_iterations: Option<usize>,
+) -> anyhow::Result<()> {
+    let mut reconciler = PolicyReconciler::default();
+    let mut iterations = 0;
+    loop {
+        run_reconcile_iteration(
+            &target,
+            platform,
+            easytier_ipv4.clone(),
+            execute,
+            &mut reconciler,
+        )?;
+        iterations += 1;
+        if max_iterations.is_some_and(|max| iterations >= max) {
+            return Ok(());
+        }
+        thread::sleep(interval);
+    }
+}
+
+fn run_reconcile_iteration(
+    target: &ReportTarget,
+    platform: PlatformKind,
+    easytier_ipv4: Option<String>,
+    execute: bool,
+    reconciler: &mut PolicyReconciler,
+) -> anyhow::Result<()> {
+    let policies = fetch_device_policies(target)?;
+    let policies_to_apply = reconciler.policies_to_apply(&policies)?;
+    for policy in policies_to_apply {
+        println!(
+            "reconcile: {:?}",
+            easytier_agent::ReconcileEvent::Apply(policy.device_policy_id.clone(), policy.version)
+        );
+        let commands =
+            apply_commands_for_policy(&policy, Some(target.web_base_url.clone()), platform)?;
+        let report = run_command_plan(
+            target.machine_id.clone(),
+            easytier_ipv4.clone(),
+            &policy,
+            commands,
+            execute,
+        );
+        post_runtime_report(target, &report)?;
+        println!("{}", serde_json::to_string(&report)?);
+    }
     Ok(())
 }
 

@@ -14,7 +14,18 @@ pub struct PolicyReconciler {
 
 impl PolicyReconciler {
     pub fn reconcile(&mut self, policies: &[DevicePolicy]) -> anyhow::Result<Vec<ReconcileEvent>> {
-        let mut events = Vec::new();
+        Ok(self
+            .policies_to_apply(policies)?
+            .into_iter()
+            .map(|policy| ReconcileEvent::Apply(policy.device_policy_id, policy.version))
+            .collect())
+    }
+
+    pub fn policies_to_apply(
+        &mut self,
+        policies: &[DevicePolicy],
+    ) -> anyhow::Result<Vec<DevicePolicy>> {
+        let mut policies_to_apply = Vec::new();
         for policy in policies {
             policy.validate()?;
             let observed_version = self
@@ -24,13 +35,10 @@ impl PolicyReconciler {
             if observed_version != Some(policy.version) {
                 self.observed_versions
                     .insert(policy.device_policy_id.clone(), policy.version);
-                events.push(ReconcileEvent::Apply(
-                    policy.device_policy_id.clone(),
-                    policy.version,
-                ));
+                policies_to_apply.push(policy.clone());
             }
         }
-        Ok(events)
+        Ok(policies_to_apply)
     }
 
     pub fn observed_version(&self, device_policy_id: &str) -> Option<u64> {
@@ -91,5 +99,22 @@ mod tests {
             vec![ReconcileEvent::Apply("p1/source".to_string(), 2)]
         );
         assert_eq!(reconciler.observed_version("p1/source"), Some(2));
+    }
+
+    #[test]
+    fn policies_to_apply_returns_only_new_versions() {
+        let mut reconciler = PolicyReconciler::default();
+        let first = policy("p1/source", 1);
+        let second = policy("p1/source", 2);
+
+        assert_eq!(
+            reconciler.policies_to_apply(&[first.clone()]).unwrap(),
+            vec![first.clone()]
+        );
+        assert!(reconciler.policies_to_apply(&[first]).unwrap().is_empty());
+        assert_eq!(
+            reconciler.policies_to_apply(&[second.clone()]).unwrap(),
+            vec![second]
+        );
     }
 }
