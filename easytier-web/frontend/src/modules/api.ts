@@ -91,6 +91,14 @@ export interface GatewayPolicySnapshot {
     observed: GatewayPolicyObservedState;
 }
 
+export interface GatewayPolicyNode {
+    machine_id: string;
+    agent_version: string;
+    easytier_ipv4?: string | null;
+    status: string;
+    last_error?: string | null;
+}
+
 export interface MachineListItem {
     client_url?: string | null;
     info?: Record<string, any> | null;
@@ -232,6 +240,10 @@ export class ApiClient {
 
     public async list_gateway_policies(): Promise<GatewayPolicySnapshot[]> {
         return await this.client.get<any, GatewayPolicySnapshot[]>('/gateway-policies');
+    }
+
+    public async list_gateway_nodes(): Promise<GatewayPolicyNode[]> {
+        return await this.client.get<any, GatewayPolicyNode[]>('/gateway-nodes');
     }
 
     public async get_gateway_policy(policyId: string): Promise<GatewayPolicySnapshot> {

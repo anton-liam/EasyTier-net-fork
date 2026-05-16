@@ -6,7 +6,7 @@ use axum_login::AuthUser;
 
 use crate::db::UserIdInDb;
 use crate::gateway_policy::{
-    GatewayFullTunnelPolicy, GatewayPolicySnapshot, PolicyError, RuntimeReport,
+    GatewayFullTunnelPolicy, GatewayPolicyNode, GatewayPolicySnapshot, PolicyError, RuntimeReport,
 };
 
 use super::users::AuthSession;
@@ -88,6 +88,19 @@ impl GatewayPolicyApi {
         Ok(Json(snapshot))
     }
 
+    async fn handle_list_nodes(
+        auth_session: AuthSession,
+        State(client_mgr): AppState,
+    ) -> Result<Json<Vec<GatewayPolicyNode>>, HttpHandleError> {
+        let user_id = Self::get_user_id(&auth_session)?;
+        Ok(Json(
+            client_mgr
+                .list_gateway_policy_nodes(user_id)
+                .await
+                .map_err(convert_anyhow_error)?,
+        ))
+    }
+
     async fn handle_get_device_policies_internal(
         State(client_mgr): AppState,
         Path((user_id, machine_id)): Path<(UserIdInDb, uuid::Uuid)>,
@@ -123,6 +136,7 @@ impl GatewayPolicyApi {
                 "/api/v1/gateway-policies/:policy-id",
                 get(Self::handle_get_policy).put(Self::handle_upsert_policy),
             )
+            .route("/api/v1/gateway-nodes", get(Self::handle_list_nodes))
     }
 
     pub fn build_route_internal() -> Router<AppStateInner> {
@@ -324,6 +338,24 @@ mod tests {
         assert_eq!(snapshot_body["desired"]["policy_id"], policy.policy_id.to_string());
         assert_eq!(snapshot_body["observed"]["source"]["status"], "active");
         assert_eq!(snapshot_body["observed"]["exit"]["status"], "prepared");
+
+        let nodes = client
+            .get(format!("{}/api/v1/gateway-nodes", base_url))
+            .header(header::COOKIE, cookie.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(nodes.status(), StatusCode::OK);
+        let nodes_body = nodes.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(nodes_body.as_array().unwrap().len(), 2);
+        assert!(
+            nodes_body
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["machine_id"] == source.to_string()
+                    && node["easytier_ipv4"] == "10.126.126.2")
+        );
 
         let list = client
             .get(format!("{}/api/v1/gateway-policies", base_url))

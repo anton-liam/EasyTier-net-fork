@@ -97,6 +97,17 @@ pub struct GatewayPolicyObservedNode {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayPolicyNode {
+    pub machine_id: Uuid,
+    pub agent_version: String,
+    #[serde(default)]
+    pub easytier_ipv4: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct PolicyStore {
     policies: HashMap<(i32, Uuid), GatewayFullTunnelPolicy>,
@@ -302,6 +313,18 @@ impl PolicyStore {
             .collect()
     }
 
+    pub fn list_nodes(&self, user_id: i32) -> Vec<GatewayPolicyNode> {
+        let mut nodes = self
+            .reports
+            .iter()
+            .filter_map(|((stored_user_id, _), report)| {
+                (*stored_user_id == user_id).then_some(GatewayPolicyNode::from(report))
+            })
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|node| node.machine_id);
+        nodes
+    }
+
     pub fn policy_snapshot(&self, user_id: i32, policy_id: Uuid) -> Option<GatewayPolicySnapshot> {
         let desired = self.policies.get(&(user_id, policy_id))?.clone();
         let source = self
@@ -361,6 +384,21 @@ impl From<&RuntimeReport> for GatewayPolicyObservedNode {
             easytier_ipv4: report.easytier_ipv4.clone(),
             policy_id: report.observed_policy_id,
             version: report.observed_policy_version,
+            status: report
+                .observed_policy_status
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            last_error: report.last_error.clone(),
+        }
+    }
+}
+
+impl From<&RuntimeReport> for GatewayPolicyNode {
+    fn from(report: &RuntimeReport) -> Self {
+        Self {
+            machine_id: report.machine_id,
+            agent_version: report.agent_version.clone(),
+            easytier_ipv4: report.easytier_ipv4.clone(),
             status: report
                 .observed_policy_status
                 .clone()

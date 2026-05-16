@@ -2,14 +2,16 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { Button, Card, Column, DataTable, Drawer, ProgressSpinner, Tag, useToast } from 'primevue';
 import { Utils } from 'easytier-frontend-lib';
-import ApiClient, { type GatewayFullTunnelPolicy, type GatewayPolicySnapshot } from '../modules/api';
+import ApiClient, { type GatewayFullTunnelPolicy, type GatewayPolicyNode, type GatewayPolicySnapshot } from '../modules/api';
 import GatewayPolicyEditor from './GatewayPolicyEditor.vue';
+
+type DeviceOption = { label: string; value: string; networkIds: string[] };
 
 const props = defineProps<{ api?: ApiClient }>();
 const toast = useToast();
 
 const policies = ref<GatewayPolicySnapshot[] | undefined>(undefined);
-const devices = ref<Utils.DeviceInfo[]>([]);
+const devices = ref<DeviceOption[]>([]);
 const selectedPolicy = ref<GatewayPolicySnapshot | null>(null);
 const detailVisible = ref(false);
 const editorVisible = ref(false);
@@ -31,12 +33,9 @@ const versionAligned = (policy: GatewayPolicySnapshot) => {
     const desired = policy.desired.desired_version;
     return policy.observed.source?.version === desired && policy.observed.exit?.version === desired;
 };
+const AGENT_REPORTED_NETWORK_ID = '00000000-0000-0000-0000-000000000000';
 
-const deviceOptions = computed(() => devices.value.map((device) => ({
-    label: `${device.hostname || 'unknown'} (${shortId(device.machine_id)})`,
-    value: device.machine_id,
-    networkIds: device.running_network_instances || [],
-})).filter((device) => !!device.value));
+const deviceOptions = computed(() => devices.value);
 
 const loadPolicies = async () => {
     if (!props.api) return;
@@ -45,7 +44,27 @@ const loadPolicies = async () => {
 
 const loadDevices = async () => {
     if (!props.api) return;
-    devices.value = (await props.api.list_machines()).map((machine) => Utils.buildDeviceInfo(machine));
+    const machineOptions = (await props.api.list_machines())
+        .map((machine) => Utils.buildDeviceInfo(machine))
+        .filter((device) => !!device.machine_id)
+        .map((device) => ({
+            label: `${device.hostname || 'WebClient'} (${shortId(device.machine_id)})`,
+            value: device.machine_id,
+            networkIds: device.running_network_instances || [],
+        }));
+
+    const nodeOptions = (await props.api.list_gateway_nodes())
+        .filter((node: GatewayPolicyNode) => !!node.machine_id)
+        .map((node: GatewayPolicyNode) => ({
+            label: `Agent ${node.easytier_ipv4 || 'unknown'} (${shortId(node.machine_id)})`,
+            value: node.machine_id,
+            networkIds: [AGENT_REPORTED_NETWORK_ID],
+        }));
+
+    const merged = new Map<string, DeviceOption>();
+    for (const option of machineOptions) merged.set(option.value, option);
+    for (const option of nodeOptions) merged.set(option.value, option);
+    devices.value = Array.from(merged.values());
 };
 
 const reloadAll = async () => {

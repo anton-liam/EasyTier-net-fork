@@ -22,7 +22,8 @@ use tokio::sync::RwLock;
 
 use crate::FeatureFlags;
 use crate::gateway_policy::{
-    DevicePolicy, GatewayFullTunnelPolicy, GatewayPolicySnapshot, PolicyStore, RuntimeReport,
+    DevicePolicy, GatewayFullTunnelPolicy, GatewayPolicyNode, GatewayPolicySnapshot, PolicyStore,
+    RuntimeReport,
 };
 use crate::webhook::SharedWebhookConfig;
 use tokio::task::JoinSet;
@@ -259,6 +260,14 @@ impl ClientManager {
     ) -> Result<Vec<GatewayPolicySnapshot>, anyhow::Error> {
         let store = self.gateway_policy_store(user_id).await?;
         Ok(store.list_policy_snapshots(user_id))
+    }
+
+    pub async fn list_gateway_policy_nodes(
+        &self,
+        user_id: UserIdInDb,
+    ) -> Result<Vec<GatewayPolicyNode>, anyhow::Error> {
+        let store = self.gateway_policy_store(user_id).await?;
+        Ok(store.list_nodes(user_id))
     }
 
     pub async fn gateway_device_policies(

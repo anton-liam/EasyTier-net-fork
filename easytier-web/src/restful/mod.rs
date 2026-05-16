@@ -259,7 +259,7 @@ impl RestfulServer {
                 .merge(GatewayPolicyApi::build_route_internal())
                 .merge(rpc::router_internal())
                 .with_state(self.client_mgr.clone())
-                .layer(axum_mw::from_fn(move |req, next| {
+                .route_layer(axum_mw::from_fn(move |req, next| {
                     let token = internal_token.clone();
                     internal_auth_middleware(token, req, next)
                 }));
