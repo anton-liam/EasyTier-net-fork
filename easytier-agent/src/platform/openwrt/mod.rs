@@ -36,7 +36,11 @@ impl OpenWrtBackend {
             ],
         )];
 
-        for cidr in &policy.managed_cidrs {
+        for cidr in policy
+            .managed_cidrs
+            .iter()
+            .filter(|cidr| !is_ipv4_default_route(cidr))
+        {
             commands.push(CommandPlan::new(
                 "sh",
                 [
@@ -47,6 +51,35 @@ impl OpenWrtBackend {
                     ),
                 ],
             ));
+        }
+
+        if policy
+            .managed_cidrs
+            .iter()
+            .any(|cidr| is_ipv4_default_route(cidr))
+        {
+            commands.push(CommandPlan::new(
+                "sh",
+                [
+                    "-c",
+                    &format!(
+                        "ip rule del from 0.0.0.0/0 lookup {table} 2>/dev/null || true",
+                        table = self.table_id
+                    ),
+                ],
+            ));
+            for iface in &policy.ingress_ifaces {
+                commands.push(CommandPlan::new(
+                    "sh",
+                    [
+                        "-c",
+                        &format!(
+                            "ip rule del iif {iface} lookup {table} 2>/dev/null || true; ip rule add iif {iface} lookup {table}",
+                            table = self.table_id
+                        ),
+                    ],
+                ));
+            }
         }
 
         if policy.include_device_traffic {
@@ -68,7 +101,11 @@ impl OpenWrtBackend {
 
     fn source_cleanup(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
         let mut commands = Vec::new();
-        for cidr in &policy.managed_cidrs {
+        for cidr in policy
+            .managed_cidrs
+            .iter()
+            .filter(|cidr| !is_ipv4_default_route(cidr))
+        {
             commands.push(CommandPlan::new(
                 "ip",
                 [
@@ -80,6 +117,25 @@ impl OpenWrtBackend {
                     &self.table_id.to_string(),
                 ],
             ));
+        }
+        if policy
+            .managed_cidrs
+            .iter()
+            .any(|cidr| is_ipv4_default_route(cidr))
+        {
+            for iface in &policy.ingress_ifaces {
+                commands.push(CommandPlan::new(
+                    "ip",
+                    [
+                        "rule",
+                        "del",
+                        "iif",
+                        iface,
+                        "lookup",
+                        &self.table_id.to_string(),
+                    ],
+                ));
+            }
         }
         if policy.include_device_traffic {
             commands.push(CommandPlan::new(
@@ -214,6 +270,10 @@ fn uci_section_name(prefix: &str, device_policy_id: &str) -> String {
     format!("easytier_agent_{prefix}_{suffix}")
 }
 
+fn is_ipv4_default_route(cidr: &str) -> bool {
+    cidr.trim() == "0.0.0.0/0"
+}
+
 fn uci_quote(value: &str) -> String {
     value.replace('\'', "'\"'\"'")
 }
@@ -296,5 +356,24 @@ mod tests {
         assert!(!command_text.contains("set firewall.@zone"));
         assert!(!command_text.contains("network.wan"));
         assert!(!command_text.contains("network.lan"));
+    }
+
+    #[test]
+    fn source_apply_routes_full_tunnel_by_ingress_interface_not_all_sources() {
+        let backend = OpenWrtBackend::default();
+        let mut policy = policy(DevicePolicyRole::ClientGatewayViaPeer);
+        policy.managed_cidrs = vec!["0.0.0.0/0".to_string()];
+        policy.ingress_ifaces = vec!["br-lan".to_string()];
+
+        let commands = backend.plan_apply(&policy).unwrap();
+        let command_text = commands
+            .iter()
+            .map(|cmd| format!("{} {}", cmd.program, cmd.args.join(" ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(command_text.contains("ip rule add iif br-lan lookup 126"));
+        assert!(command_text.contains("ip rule del from 0.0.0.0/0 lookup 126"));
+        assert!(!command_text.contains("ip rule add from 0.0.0.0/0 lookup 126"));
     }
 }
