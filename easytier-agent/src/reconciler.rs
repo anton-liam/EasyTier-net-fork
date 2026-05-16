@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use crate::DevicePolicy;
 
@@ -7,9 +10,15 @@ pub enum ReconcileEvent {
     Apply(String, u64),
 }
 
+#[derive(Debug)]
+struct ObservedPolicy {
+    version: u64,
+    applied_at: Instant,
+}
+
 #[derive(Debug, Default)]
 pub struct PolicyReconciler {
-    observed_versions: HashMap<String, u64>,
+    observed_versions: HashMap<String, ObservedPolicy>,
 }
 
 impl PolicyReconciler {
@@ -25,16 +34,33 @@ impl PolicyReconciler {
         &mut self,
         policies: &[DevicePolicy],
     ) -> anyhow::Result<Vec<DevicePolicy>> {
+        self.policies_to_apply_at(policies, Instant::now(), None)
+    }
+
+    pub fn policies_to_apply_at(
+        &mut self,
+        policies: &[DevicePolicy],
+        now: Instant,
+        reapply_interval: Option<Duration>,
+    ) -> anyhow::Result<Vec<DevicePolicy>> {
         let mut policies_to_apply = Vec::new();
         for policy in policies {
             policy.validate()?;
-            let observed_version = self
-                .observed_versions
-                .get(&policy.device_policy_id)
-                .copied();
-            if observed_version != Some(policy.version) {
-                self.observed_versions
-                    .insert(policy.device_policy_id.clone(), policy.version);
+            let observed = self.observed_versions.get(&policy.device_policy_id);
+            let version_changed = observed.map(|observed| observed.version) != Some(policy.version);
+            let reapply_due = observed.is_some_and(|observed| {
+                reapply_interval.is_some_and(|interval| {
+                    now.duration_since(observed.applied_at) >= interval
+                })
+            });
+            if version_changed || reapply_due {
+                self.observed_versions.insert(
+                    policy.device_policy_id.clone(),
+                    ObservedPolicy {
+                        version: policy.version,
+                        applied_at: now,
+                    },
+                );
                 policies_to_apply.push(policy.clone());
             }
         }
@@ -42,12 +68,16 @@ impl PolicyReconciler {
     }
 
     pub fn observed_version(&self, device_policy_id: &str) -> Option<u64> {
-        self.observed_versions.get(device_policy_id).copied()
+        self.observed_versions
+            .get(device_policy_id)
+            .map(|observed| observed.version)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use uuid::Uuid;
 
     use crate::{DevicePolicy, DevicePolicyRole, ExitEgress, PolicyReconciler, ReconcileEvent};
@@ -115,6 +145,40 @@ mod tests {
         assert_eq!(
             reconciler.policies_to_apply(&[second.clone()]).unwrap(),
             vec![second]
+        );
+    }
+
+    #[test]
+    fn policies_to_apply_reapplies_after_interval() {
+        let mut reconciler = PolicyReconciler::default();
+        let policy = policy("p1/source", 1);
+        let started_at = Instant::now();
+
+        assert_eq!(
+            reconciler
+                .policies_to_apply_at(&[policy.clone()], started_at, Some(Duration::from_secs(60)))
+                .unwrap(),
+            vec![policy.clone()]
+        );
+        assert!(
+            reconciler
+                .policies_to_apply_at(
+                    &[policy.clone()],
+                    started_at + Duration::from_secs(59),
+                    Some(Duration::from_secs(60))
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reconciler
+                .policies_to_apply_at(
+                    &[policy.clone()],
+                    started_at + Duration::from_secs(60),
+                    Some(Duration::from_secs(60))
+                )
+                .unwrap(),
+            vec![policy]
         );
     }
 }

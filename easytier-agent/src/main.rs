@@ -1,4 +1,9 @@
-use std::{fs, path::PathBuf, thread, time::Duration};
+use std::{
+    fs,
+    path::PathBuf,
+    thread,
+    time::{Duration, Instant},
+};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use easytier_agent::{
@@ -8,6 +13,8 @@ use easytier_agent::{
     derive_policy_status_for_policy, dry_run_plan, fetch_device_policies,
     platform::linux::LinuxBackend, platform::openwrt::OpenWrtBackend, post_runtime_report,
 };
+
+const DEFAULT_REAPPLY_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -464,7 +471,8 @@ fn run_reconcile_iteration(
     reconciler: &mut PolicyReconciler,
 ) -> anyhow::Result<()> {
     let policies = fetch_device_policies(target)?;
-    let policies_to_apply = reconciler.policies_to_apply(&policies)?;
+    let policies_to_apply =
+        reconciler.policies_to_apply_at(&policies, Instant::now(), Some(DEFAULT_REAPPLY_INTERVAL))?;
     for policy in policies_to_apply {
         println!(
             "reconcile: {:?}",
