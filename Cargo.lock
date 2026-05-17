@@ -485,7 +485,11 @@ dependencies = [
  "base64 0.22.1",
  "http",
  "log",
+ "rustls",
+ "serde",
+ "serde_json",
  "url",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
@@ -2377,6 +2381,19 @@ dependencies = [
  "zerocopy 0.7.35",
  "zip",
  "zstd",
+]
+
+[[package]]
+name = "easytier-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "attohttpc",
+ "clap",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.11",
+ "uuid",
 ]
 
 [[package]]

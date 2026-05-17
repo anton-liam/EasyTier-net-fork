@@ -726,7 +726,6 @@ const handleResize = () => {
             </template>
             <template #end>
                 <div class="flex items-center gap-3">
-                    <div class="hidden sm:block border-r-1 surface-border h-4 mr-2"></div>
                     <div class="flex items-center gap-2">
                         <label for="detailed-view" class="text-sm text-500 hidden sm:block">{{
                             t('web.device.show_detailed_view') }}</label>

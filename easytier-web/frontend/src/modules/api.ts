@@ -36,6 +36,76 @@ export interface Summary {
     device_count: number;
 }
 
+export type GatewayPolicyRole = 'client_gateway_via_peer' | 'provide_exit_for_gateway';
+export type ExitEgressMode = 'auto' | 'interface';
+
+export interface ExitEgress {
+    mode: ExitEgressMode;
+    iface?: string | null;
+}
+
+export interface HealthcheckConfig {
+    control_plane_timeout_seconds: number;
+    exit_timeout_seconds: number;
+}
+
+export interface RollbackConfig {
+    enabled: boolean;
+    max_fail_seconds: number;
+}
+
+export interface GatewayFullTunnelPolicy {
+    policy_id: string;
+    enabled: boolean;
+    network_instance_id: string;
+    source_machine_id: string;
+    managed_cidrs: string[];
+    ingress_ifaces: string[];
+    include_device_traffic: boolean;
+    exit_machine_id: string;
+    exit_egress: ExitEgress;
+    desired_version: number;
+    protect_control_plane: boolean;
+    healthcheck: HealthcheckConfig;
+    rollback: RollbackConfig;
+}
+
+export interface GatewayPolicyObservedNode {
+    machine_id: string;
+    agent_version: string;
+    easytier_ipv4?: string | null;
+    policy_id?: string | null;
+    role?: GatewayPolicyRole | null;
+    version?: number | null;
+    status: string;
+    last_error?: string | null;
+}
+
+export interface GatewayPolicyObservedState {
+    source?: GatewayPolicyObservedNode | null;
+    exit?: GatewayPolicyObservedNode | null;
+}
+
+export interface GatewayPolicySnapshot {
+    desired: GatewayFullTunnelPolicy;
+    observed: GatewayPolicyObservedState;
+}
+
+export interface GatewayPolicyNode {
+    machine_id: string;
+    agent_version: string;
+    easytier_ipv4?: string | null;
+    last_report_at?: string | null;
+    status: string;
+    last_error?: string | null;
+}
+
+export interface MachineListItem {
+    client_url?: string | null;
+    info?: Record<string, any> | null;
+    location?: Record<string, any> | null;
+}
+
 export interface ListNetworkInstanceIdResponse {
     running_inst_ids: Array<Utils.UUID>,
     disabled_inst_ids: Array<Utils.UUID>,
@@ -164,9 +234,25 @@ export class ApiClient {
         return response;
     }
 
-    public async list_machines(): Promise<Array<any>> {
-        const response = await this.client.get<any, Record<string, Array<any>>>('/machines');
-        return response.machines;
+    public async list_machines(): Promise<MachineListItem[]> {
+        const response = await this.client.get<any, { machines: MachineListItem[] }>('/machines');
+        return response.machines || [];
+    }
+
+    public async list_gateway_policies(): Promise<GatewayPolicySnapshot[]> {
+        return await this.client.get<any, GatewayPolicySnapshot[]>('/gateway-policies');
+    }
+
+    public async list_gateway_nodes(): Promise<GatewayPolicyNode[]> {
+        return await this.client.get<any, GatewayPolicyNode[]>('/gateway-nodes');
+    }
+
+    public async get_gateway_policy(policyId: string): Promise<GatewayPolicySnapshot> {
+        return await this.client.get<any, GatewayPolicySnapshot>(`/gateway-policies/${policyId}`);
+    }
+
+    public async upsert_gateway_policy(policy: GatewayFullTunnelPolicy): Promise<void> {
+        await this.client.post('/gateway-policies', policy);
     }
 
     public async get_summary(): Promise<Summary> {

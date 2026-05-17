@@ -1,5 +1,6 @@
 mod auth;
 pub(crate) mod captcha;
+mod gateway_policy;
 mod network;
 pub(crate) mod oidc;
 mod rpc;
@@ -19,6 +20,7 @@ use axum_messages::MessagesManagerLayer;
 use easytier::common::config::{ConfigLoader, TomlConfigLoader};
 use easytier::launcher::NetworkConfig;
 use easytier::proto::rpc_types;
+use gateway_policy::GatewayPolicyApi;
 use network::NetworkApi;
 use sea_orm::DbErr;
 use tokio::net::TcpListener;
@@ -254,9 +256,10 @@ impl RestfulServer {
                     delete(Self::handle_disconnect_session_internal),
                 )
                 .merge(NetworkApi::build_route_internal())
+                .merge(GatewayPolicyApi::build_route_internal())
                 .merge(rpc::router_internal())
                 .with_state(self.client_mgr.clone())
-                .layer(axum_mw::from_fn(move |req, next| {
+                .route_layer(axum_mw::from_fn(move |req, next| {
                     let token = internal_token.clone();
                     internal_auth_middleware(token, req, next)
                 }));
@@ -269,6 +272,7 @@ impl RestfulServer {
             .route("/api/v1/summary", get(Self::handle_get_summary))
             .route("/api/v1/sessions", get(Self::handle_list_all_sessions))
             .merge(NetworkApi::build_route())
+            .merge(GatewayPolicyApi::build_route())
             .merge(rpc::router())
             .route_layer(login_required!(Backend))
             .merge(auth::router().layer(Extension(self.feature_flags.clone())))

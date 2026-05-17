@@ -1,16 +1,21 @@
 <script setup lang="ts">
-import { Utils } from 'easytier-frontend-lib';
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
 
+type DeviceLike = {
+  hostname: string;
+  public_ip: string;
+  running_network_count: number;
+  report_time: string;
+  easytier_version: string;
+  machine_id?: string;
+};
 
 // 定义组件接收的 props
 defineProps<{
-  device: Utils.DeviceInfo;
-  // 可以传入额外的样式类
+  device: DeviceLike;
   containerClass?: string;
-  // 是否使用紧凑布局
   compact?: boolean;
 }>();
 
