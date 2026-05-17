@@ -117,6 +117,8 @@ enum PlatformKind {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use clap::Parser;
 
     use super::{Cli, Command, PlatformKind};
@@ -340,6 +342,31 @@ mod tests {
         assert_eq!(interval_seconds, 3);
         assert_eq!(web_base_url, "http://127.0.0.1:11211");
     }
+
+    #[test]
+    fn run_loop_continues_after_iteration_error() {
+        let mut attempts = 0usize;
+        let mut slept = 0usize;
+
+        super::run_loop_with_iteration(
+            Duration::from_secs(1),
+            Some(3),
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    anyhow::bail!("web temporarily unreachable");
+                }
+                Ok(())
+            },
+            |_| {
+                slept += 1;
+            },
+        )
+        .unwrap();
+
+        assert_eq!(attempts, 3);
+        assert_eq!(slept, 2);
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -464,21 +491,43 @@ fn run_loop(
     max_iterations: Option<usize>,
 ) -> anyhow::Result<()> {
     let mut reconciler = PolicyReconciler::default();
+    run_loop_with_iteration(
+        interval,
+        max_iterations,
+        || {
+            run_reconcile_iteration(
+                &target,
+                platform,
+                easytier_ipv4.clone(),
+                easytier_iface.clone(),
+                execute,
+                &mut reconciler,
+            )
+        },
+        thread::sleep,
+    )
+}
+
+fn run_loop_with_iteration<I, S>(
+    interval: Duration,
+    max_iterations: Option<usize>,
+    mut iteration: I,
+    mut sleep: S,
+) -> anyhow::Result<()>
+where
+    I: FnMut() -> anyhow::Result<()>,
+    S: FnMut(Duration),
+{
     let mut iterations = 0;
     loop {
-        run_reconcile_iteration(
-            &target,
-            platform,
-            easytier_ipv4.clone(),
-            easytier_iface.clone(),
-            execute,
-            &mut reconciler,
-        )?;
+        if let Err(error) = iteration() {
+            eprintln!("reconcile iteration failed: {error:#}");
+        }
         iterations += 1;
         if max_iterations.is_some_and(|max| iterations >= max) {
             return Ok(());
         }
-        thread::sleep(interval);
+        sleep(interval);
     }
 }
 
