@@ -114,6 +114,7 @@ mod tests {
             exit_machine_id: "node-b".to_string(),
             exit_peer_ipv4: Some("10.126.126.3".to_string()),
             source_peer_ipv4: None,
+            easytier_iface: "easytier0".to_string(),
             exit_egress: ExitEgress::default(),
             protect_control_plane: true,
             rollback_enabled: true,

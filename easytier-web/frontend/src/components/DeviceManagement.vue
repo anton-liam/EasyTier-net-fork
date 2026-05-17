@@ -1,8 +1,12 @@
 <script setup lang="ts">
 import { NetworkTypes, Utils, Api, RemoteManagement } from 'easytier-frontend-lib';
-import { computed } from 'vue';
+import { Button, Message } from 'primevue';
+import { computed, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import ApiClient from '../modules/api';
+import { useI18n } from 'vue-i18n';
+import ApiClient, { type GatewayPolicySnapshot } from '../modules/api';
+import GatewayPolicyEditor from './GatewayPolicyEditor.vue';
+import GatewayPolicyTopology from './GatewayPolicyTopology.vue';
 
 
 const props = defineProps<{
@@ -12,6 +16,7 @@ const props = defineProps<{
 
 const emits = defineEmits(['update']);
 
+const { t } = useI18n();
 const route = useRoute();
 const router = useRouter();
 
@@ -38,6 +43,13 @@ const selectedInstanceId = computed({
 });
 
 const remoteClient = computed<Api.RemoteClient>(() => props.api.get_remote_client(deviceId.value));
+const gatewayPolicyEditorVisible = ref(false);
+const gatewayPolicyTopologyVisible = ref(false);
+const editingGatewayPolicy = ref<GatewayPolicySnapshot | null>(null);
+const topologyGatewayPolicy = ref<GatewayPolicySnapshot | null>(null);
+const gatewayPolicies = ref<GatewayPolicySnapshot[]>([]);
+const selectedGatewayNetworkId = ref('');
+const selectedGatewayNetworkInfo = ref<NetworkTypes.NetworkInstance | null>(null);
 
 const newConfigGenerator = () => {
     const config = NetworkTypes.DEFAULT_NETWORK_CONFIG();
@@ -45,11 +57,134 @@ const newConfigGenerator = () => {
     return config;
 }
 
+type GatewayPolicyActionContext = {
+    instanceId?: string;
+    networkInfo?: NetworkTypes.NetworkInstance | null;
+    running?: boolean;
+    errorMessage?: string;
+};
+
+const shortId = (value?: string | null) => value ? value.slice(0, 8) : '-';
+
+const gatewayDeviceOptions = computed(() => (props.deviceList || [])
+    .filter((device) => !!device.machine_id)
+    .map((device) => ({
+        label: `${device.hostname || 'EasyTier'} (${shortId(device.machine_id)})`,
+        value: device.machine_id,
+        hostname: device.hostname,
+        publicIp: device.public_ip,
+        networkIds: device.running_network_instances || [],
+    })));
+
+const controlHost = computed(() => {
+    const apiHost = route.params.apiHost as string | undefined;
+    if (!apiHost) return '';
+    try {
+        return new URL(atob(apiHost)).hostname;
+    } catch {
+        return '';
+    }
+});
+
+const exitCandidateCount = (instanceId?: string) => {
+    if (!instanceId) return 0;
+    return gatewayDeviceOptions.value.filter((device) => (
+        device.value !== deviceId.value && device.networkIds.includes(instanceId)
+    )).length;
+};
+
+const gatewayPolicyDisabledReason = (ctx: GatewayPolicyActionContext) => {
+    if (!deviceInfo.value) return t('web.gateway_policy.disabled_not_connected');
+    if (!ctx.instanceId) return t('web.gateway_policy.disabled_select_network');
+    if (!ctx.running) return t('web.gateway_policy.disabled_network_not_running');
+    if (ctx.errorMessage) return t('web.gateway_policy.disabled_network_error', { error: ctx.errorMessage });
+    if (!deviceInfo.value.running_network_instances?.includes(ctx.instanceId)) return t('web.gateway_policy.disabled_node_not_in_network');
+    if (exitCandidateCount(ctx.instanceId) === 0) return t('web.gateway_policy.disabled_no_exit_peer');
+    return '';
+};
+
+const canOpenGatewayPolicy = (ctx: GatewayPolicyActionContext) => gatewayPolicyDisabledReason(ctx) === '';
+
+const selectGatewayPolicy = (policies: GatewayPolicySnapshot[], sourceMachineId: string, networkInstanceId: string) => (
+    policies
+        .filter((policy) => (
+            policy.desired.source_machine_id === sourceMachineId
+            && policy.desired.network_instance_id === networkInstanceId
+        ))
+        .sort((left, right) => {
+            if (left.desired.enabled !== right.desired.enabled) return left.desired.enabled ? -1 : 1;
+            return right.desired.desired_version - left.desired.desired_version;
+        })[0] || null
+);
+
+const openGatewayPolicyEditor = async (ctx: GatewayPolicyActionContext) => {
+    if (!ctx.instanceId || !canOpenGatewayPolicy(ctx)) return;
+    selectedGatewayNetworkId.value = ctx.instanceId;
+    selectedGatewayNetworkInfo.value = ctx.networkInfo || null;
+    gatewayPolicies.value = await props.api.list_gateway_policies();
+    editingGatewayPolicy.value = selectGatewayPolicy(gatewayPolicies.value, deviceId.value, ctx.instanceId);
+    gatewayPolicyEditorVisible.value = true;
+};
+
+const openGatewayTopology = async (ctx: GatewayPolicyActionContext) => {
+    if (!ctx.instanceId || !canOpenGatewayPolicy(ctx)) return;
+    selectedGatewayNetworkId.value = ctx.instanceId;
+    selectedGatewayNetworkInfo.value = ctx.networkInfo || null;
+    gatewayPolicies.value = await props.api.list_gateway_policies();
+    topologyGatewayPolicy.value = selectGatewayPolicy(gatewayPolicies.value, deviceId.value, ctx.instanceId);
+    gatewayPolicyTopologyVisible.value = true;
+};
+
 </script>
 
 <template>
     <RemoteManagement :api="remoteClient" v-model:instance-id="selectedInstanceId"
-        :new-config-generator="newConfigGenerator" />
+        :new-config-generator="newConfigGenerator">
+        <template #network-status-actions="slotProps">
+            <div class="mb-4 border border-surface-200 bg-surface-50 p-3">
+                <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                    <div>
+                        <div class="font-medium">{{ t('web.gateway_policy.title') }}</div>
+                        <div class="text-sm text-secondary">
+                            {{ t('web.gateway_policy.description') }}
+                        </div>
+                    </div>
+                    <div class="flex flex-wrap gap-2">
+                        <Button icon="pi pi-sitemap" :label="t('web.gateway_policy.topology_button')" severity="secondary"
+                            :disabled="!canOpenGatewayPolicy(slotProps)"
+                            @click="openGatewayTopology(slotProps)" />
+                        <Button icon="pi pi-share-alt" :label="t('web.gateway_policy.configure_button')" severity="secondary"
+                            :disabled="!canOpenGatewayPolicy(slotProps)"
+                            @click="openGatewayPolicyEditor(slotProps)" />
+                    </div>
+                </div>
+                <Message v-if="!canOpenGatewayPolicy(slotProps)" severity="warn" :closable="false" class="mt-3">
+                    {{ gatewayPolicyDisabledReason(slotProps) }}
+                </Message>
+            </div>
+        </template>
+    </RemoteManagement>
+
+    <GatewayPolicyEditor
+        v-model:visible="gatewayPolicyEditorVisible"
+        :api="api"
+        :devices="gatewayDeviceOptions"
+        :policy="editingGatewayPolicy"
+        :initial-source-machine-id="deviceId"
+        :initial-network-instance-id="selectedGatewayNetworkId"
+        @saved="emits('update')"
+    />
+
+    <GatewayPolicyTopology
+        v-model:visible="gatewayPolicyTopologyVisible"
+        :api="api"
+        :devices="gatewayDeviceOptions"
+        :policy="topologyGatewayPolicy"
+        :source-machine-id="deviceId"
+        :network-instance-id="selectedGatewayNetworkId"
+        :network-info="selectedGatewayNetworkInfo"
+        :control-host="controlHost"
+    />
 </template>
 
 <style scoped>
@@ -64,7 +199,7 @@ const newConfigGenerator = () => {
     overflow-y: auto;
 }
 
-/* 按钮样式 */
+/* Button layout */
 .button-container {
     gap: 0.5rem;
 }
@@ -74,7 +209,7 @@ const newConfigGenerator = () => {
     min-width: 3rem;
 }
 
-/* 菜单样式定制 */
+/* Menu layout */
 :deep(.p-menu) {
     min-width: 12rem;
     box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
@@ -103,7 +238,7 @@ const newConfigGenerator = () => {
     background-color: var(--red-50);
 }
 
-/* 按钮图标样式 */
+/* Icon button layout */
 :deep(.p-button-icon-only) {
     width: 2.5rem !important;
     padding: 0.5rem !important;
@@ -113,7 +248,7 @@ const newConfigGenerator = () => {
     font-size: 1rem;
 }
 
-/* 网络选择相关样式 */
+/* Network selector layout */
 .network-label {
     white-space: nowrap;
 }
@@ -159,7 +294,7 @@ const newConfigGenerator = () => {
         padding: 0.75rem;
     }
 
-    /* 在小屏幕上缩短网络标签文本 */
+    /* Keep network labels compact on small screens */
     .network-label {
         font-size: 0.9rem;
     }

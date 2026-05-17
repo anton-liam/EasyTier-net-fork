@@ -95,6 +95,7 @@ export interface GatewayPolicyNode {
     machine_id: string;
     agent_version: string;
     easytier_ipv4?: string | null;
+    last_report_at?: string | null;
     status: string;
     last_error?: string | null;
 }
@@ -234,8 +235,8 @@ export class ApiClient {
     }
 
     public async list_machines(): Promise<MachineListItem[]> {
-        const response = await this.client.get<any, Record<string, MachineListItem[]>>('/machines');
-        return response.machines;
+        const response = await this.client.get<any, { machines: MachineListItem[] }>('/machines');
+        return response.machines || [];
     }
 
     public async list_gateway_policies(): Promise<GatewayPolicySnapshot[]> {

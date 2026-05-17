@@ -28,6 +28,13 @@ const configFile = ref();
 
 const curNetworkInfo = ref<NetworkTypes.NetworkInstance | null>(null);
 
+const networkStatusSlotContext = computed(() => ({
+    instanceId: selectedInstanceId.value?.uuid,
+    networkInfo: curNetworkInfo.value,
+    running: !!curNetworkInfo.value?.running,
+    errorMessage: curNetworkInfo.value?.error_msg ?? '',
+}));
+
 const showConfigEditDialog = ref(false);
 const isEditingNetwork = ref(false); // Flag to indicate if we're in network editing mode
 const currentNetworkConfig = ref<NetworkTypes.NetworkConfig | undefined>(undefined);
@@ -573,6 +580,8 @@ onUnmounted(() => {
                     class="mb-4">
                 </Status>
                 <Message v-else severity="error" class="mb-4">{{ curNetworkInfo?.error_msg }}</Message>
+
+                <slot name="network-status-actions" v-bind="networkStatusSlotContext"></slot>
 
                 <div class="text-center mt-4">
                     <Button @click="stopNetwork" :disabled="!currentNetworkControl.deletable.value"

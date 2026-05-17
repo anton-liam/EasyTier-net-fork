@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { Button, Dialog, Dropdown, InputSwitch, Textarea } from 'primevue';
+import { Button, Dialog, Dropdown, InputSwitch, Message, Textarea } from 'primevue';
+import { useI18n } from 'vue-i18n';
 import ApiClient, { type GatewayFullTunnelPolicy, type GatewayPolicySnapshot } from '../modules/api';
 
 type DeviceOption = { label: string; value: string; networkIds: string[] };
@@ -10,12 +11,17 @@ const props = defineProps<{
     visible: boolean;
     devices: DeviceOption[];
     policy?: GatewayPolicySnapshot | null;
+    initialSourceMachineId?: string;
+    initialExitMachineId?: string;
+    initialNetworkInstanceId?: string;
 }>();
 
 const emit = defineEmits<{
     'update:visible': [value: boolean];
     saved: [];
 }>();
+
+const { t } = useI18n();
 
 const newUuid = () => {
     if (crypto.randomUUID) return crypto.randomUUID();
@@ -39,24 +45,26 @@ const exitEgressIface = ref('');
 const saving = ref(false);
 const saveError = ref('');
 
-watch(() => props.policy, (policy) => {
+watch(() => [props.policy, props.initialSourceMachineId, props.initialExitMachineId, props.initialNetworkInstanceId, props.visible], ([policy]) => {
     if (policy) {
-        policyId.value = policy.desired.policy_id;
-        enabled.value = policy.desired.enabled;
-        networkInstanceId.value = policy.desired.network_instance_id;
-        sourceMachineId.value = policy.desired.source_machine_id;
-        exitMachineId.value = policy.desired.exit_machine_id;
-        managedCidrsText.value = policy.desired.managed_cidrs.join('\n');
-        ingressIfacesText.value = policy.desired.ingress_ifaces.join('\n');
-        includeDeviceTraffic.value = policy.desired.include_device_traffic;
-        exitEgressMode.value = policy.desired.exit_egress.mode;
-        exitEgressIface.value = policy.desired.exit_egress.iface || '';
+        const snapshot = policy as GatewayPolicySnapshot;
+        policyId.value = snapshot.desired.policy_id;
+        enabled.value = snapshot.desired.enabled;
+        networkInstanceId.value = snapshot.desired.network_instance_id;
+        sourceMachineId.value = snapshot.desired.source_machine_id;
+        exitMachineId.value = snapshot.desired.exit_machine_id;
+        managedCidrsText.value = snapshot.desired.managed_cidrs.join('\n');
+        ingressIfacesText.value = snapshot.desired.ingress_ifaces.join('\n');
+        includeDeviceTraffic.value = snapshot.desired.include_device_traffic;
+        exitEgressMode.value = snapshot.desired.exit_egress.mode;
+        exitEgressIface.value = snapshot.desired.exit_egress.iface || '';
     } else {
         policyId.value = newUuid();
         enabled.value = false;
         networkInstanceId.value = '';
-        sourceMachineId.value = '';
-        exitMachineId.value = '';
+        sourceMachineId.value = props.initialSourceMachineId || '';
+        exitMachineId.value = props.initialExitMachineId || '';
+        networkInstanceId.value = props.initialNetworkInstanceId || '';
         managedCidrsText.value = '';
         ingressIfacesText.value = '';
         includeDeviceTraffic.value = true;
@@ -68,6 +76,13 @@ watch(() => props.policy, (policy) => {
 
 const sourceDevice = computed(() => props.devices.find((device) => device.value === sourceMachineId.value));
 const exitDevice = computed(() => props.devices.find((device) => device.value === exitMachineId.value));
+const exitDeviceOptions = computed(() => {
+    const networkId = networkInstanceId.value || props.initialNetworkInstanceId || '';
+    return props.devices.filter((device) => (
+        device.value !== sourceMachineId.value
+        && (!networkId || device.networkIds.includes(networkId))
+    ));
+});
 const commonNetworkIds = computed(() => {
     const sourceIds = new Set(sourceDevice.value?.networkIds || []);
     const ids = (exitDevice.value?.networkIds || []).filter((id) => sourceIds.has(id));
@@ -83,22 +98,31 @@ const commonNetworkIds = computed(() => {
 });
 
 watch(commonNetworkIds, (ids) => {
-    if (ids.length === 1) {
+    if (props.initialNetworkInstanceId && ids.includes(props.initialNetworkInstanceId)) {
+        networkInstanceId.value = props.initialNetworkInstanceId;
+    } else if (ids.length === 1) {
         networkInstanceId.value = ids[0];
     } else if (!ids.includes(networkInstanceId.value)) {
         networkInstanceId.value = '';
     }
 });
 
+watch([exitDeviceOptions, () => props.visible], ([options]) => {
+    if (!props.visible || props.policy || exitMachineId.value) return;
+    if (options.length === 1) {
+        exitMachineId.value = options[0].value;
+    }
+});
+
 const errors = computed(() => {
     const result: string[] = [];
-    if (!sourceMachineId.value) result.push('请选择入口节点');
-    if (!exitMachineId.value) result.push('请选择出口节点');
-    if (sourceMachineId.value && sourceMachineId.value === exitMachineId.value) result.push('入口节点和出口节点不能相同');
-    if (sourceMachineId.value && exitMachineId.value && commonNetworkIds.value.length === 0) result.push('入口节点和出口节点没有共同的 EasyTier network instance');
-    if (!networkInstanceId.value) result.push('请选择 EasyTier network instance id');
+    if (!sourceMachineId.value) result.push(t('web.gateway_policy.error_select_source'));
+    if (!exitMachineId.value) result.push(t('web.gateway_policy.error_select_exit'));
+    if (sourceMachineId.value && sourceMachineId.value === exitMachineId.value) result.push(t('web.gateway_policy.error_same_source_exit'));
+    if (sourceMachineId.value && exitMachineId.value && commonNetworkIds.value.length === 0) result.push(t('web.gateway_policy.error_no_common_network'));
+    if (!networkInstanceId.value) result.push(t('web.gateway_policy.error_select_network'));
     const managedCidrs = managedCidrsText.value.split(/\s+/).filter(Boolean);
-    if (managedCidrs.length === 0 && !includeDeviceTraffic.value) result.push('受管网段为空时必须包含设备自身流量');
+    if (managedCidrs.length === 0 && !includeDeviceTraffic.value) result.push(t('web.gateway_policy.error_empty_scope'));
     return result;
 });
 
@@ -146,46 +170,46 @@ const save = async () => {
 </script>
 
 <template>
-    <Dialog :visible="visible" @update:visible="emit('update:visible', $event)" modal class="w-full md:w-2/5" :header="policy ? '编辑出口策略' : '创建出口策略'">
-        <div class="space-y-4">
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div>
-                    <label class="text-sm text-gray-500">入口节点</label>
+    <Dialog :visible="visible" @update:visible="emit('update:visible', $event)" modal class="w-full md:w-7/12 lg:w-5/12" :header="policy ? t('web.gateway_policy.edit_policy') : t('web.gateway_policy.create_policy')">
+        <div class="flex flex-col gap-4">
+            <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div class="field">
+                    <label>{{ t('web.gateway_policy.source_node') }}</label>
                     <Dropdown v-model="sourceMachineId" :options="devices" optionLabel="label" optionValue="value" class="w-full" />
                 </div>
-                <div>
-                    <label class="text-sm text-gray-500">出口节点</label>
-                    <Dropdown v-model="exitMachineId" :options="devices" optionLabel="label" optionValue="value" class="w-full" />
+                <div class="field">
+                    <label>{{ t('web.gateway_policy.exit_node') }}</label>
+                    <Dropdown v-model="exitMachineId" :options="exitDeviceOptions" optionLabel="label" optionValue="value" class="w-full" />
                 </div>
             </div>
-            <div>
-                <label class="text-sm text-gray-500">Network Instance ID</label>
-                <Dropdown v-model="networkInstanceId" :options="commonNetworkIds" class="w-full font-mono" placeholder="选择 source/exit 共同网络实例" />
+            <div class="field">
+                <label>{{ t('web.gateway_policy.network_instance_id') }}</label>
+                <Dropdown v-model="networkInstanceId" :options="commonNetworkIds" class="w-full font-mono" :placeholder="t('web.gateway_policy.select_common_network')" />
             </div>
-            <div>
-                <label class="text-sm text-gray-500">受管网段，每行一个</label>
+            <div class="field">
+                <label>{{ t('web.gateway_policy.managed_cidrs') }}</label>
                 <Textarea v-model="managedCidrsText" class="w-full font-mono" rows="3" placeholder="192.168.10.0/24" />
             </div>
-            <div>
-                <label class="text-sm text-gray-500">入口接口，可空，每行一个</label>
+            <div class="field">
+                <label>{{ t('web.gateway_policy.ingress_ifaces') }}</label>
                 <Textarea v-model="ingressIfacesText" class="w-full font-mono" rows="2" placeholder="br-lan" />
             </div>
             <div class="flex items-center gap-3">
                 <InputSwitch v-model="includeDeviceTraffic" />
-                <span>包含 R3S 自身普通出站流量</span>
+                <span>{{ t('web.gateway_policy.include_device_traffic') }}</span>
             </div>
             <div class="flex items-center gap-3">
                 <InputSwitch v-model="enabled" />
-                <span>启用策略</span>
+                <span>{{ t('web.gateway_policy.enable_policy') }}</span>
             </div>
-            <div v-if="errors.length" class="text-sm text-red-600 space-y-1">
+            <Message v-if="errors.length" severity="warn" :closable="false">
                 <div v-for="error in errors" :key="error">{{ error }}</div>
-            </div>
-            <div v-if="saveError" class="text-sm text-red-600 break-all">{{ saveError }}</div>
+            </Message>
+            <Message v-if="saveError" severity="error" :closable="false">{{ saveError }}</Message>
         </div>
         <template #footer>
-            <Button label="取消" severity="secondary" @click="emit('update:visible', false)" />
-            <Button label="保存" icon="pi pi-save" :disabled="!canSave || saving" :loading="saving" @click="save" />
+            <Button :label="t('web.common.cancel')" severity="secondary" @click="emit('update:visible', false)" />
+            <Button :label="t('web.common.save')" icon="pi pi-save" :disabled="!canSave || saving" :loading="saving" @click="save" />
         </template>
     </Dialog>
 </template>

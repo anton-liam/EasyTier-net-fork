@@ -230,21 +230,42 @@ impl Db {
             INSERT INTO gateway_runtime_reports (
                 user_id,
                 machine_id,
+                policy_id,
+                role,
+                device_policy_id,
                 report_json,
                 easytier_ipv4,
+                last_report_at,
                 update_time
             )
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, machine_id) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, machine_id, policy_id, role) DO UPDATE SET
+                device_policy_id = excluded.device_policy_id,
                 report_json = excluded.report_json,
                 easytier_ipv4 = excluded.easytier_ipv4,
+                last_report_at = excluded.last_report_at,
                 update_time = excluded.update_time
             "#,
         )
         .bind(user_id)
         .bind(report.machine_id.to_string())
+        .bind(
+            report
+                .observed_policy_id
+                .or(report.policy_id)
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+        )
+        .bind(
+            report
+                .role
+                .map(|role| role.as_str().to_string())
+                .unwrap_or_default(),
+        )
+        .bind(report.device_policy_id.clone())
         .bind(report_json)
         .bind(report.easytier_ipv4.clone())
+        .bind(now.clone())
         .bind(now)
         .execute(&self.db)
         .await
@@ -259,9 +280,10 @@ impl Db {
     ) -> Result<Vec<RuntimeReport>, DbErr> {
         let rows = sqlx::query(
             r#"
-            SELECT report_json
+            SELECT report_json, last_report_at
             FROM gateway_runtime_reports
             WHERE user_id = ?
+            ORDER BY last_report_at
             "#,
         )
         .bind(user_id)
@@ -272,7 +294,13 @@ impl Db {
         rows.into_iter()
             .map(|row| {
                 let report_json: String = row.get("report_json");
-                serde_json::from_str(&report_json).map_err(|e| DbErr::Json(e.to_string()))
+                let mut report: RuntimeReport =
+                    serde_json::from_str(&report_json).map_err(|e| DbErr::Json(e.to_string()))?;
+                report.last_report_at = row
+                    .try_get::<Option<String>, _>("last_report_at")
+                    .ok()
+                    .flatten();
+                Ok(report)
             })
             .collect()
     }
@@ -652,6 +680,12 @@ mod tests {
                 machine_id: source,
                 agent_version: "0.1.0".to_string(),
                 easytier_ipv4: Some("10.126.126.2".to_string()),
+                last_report_at: Some("2026-05-16T10:00:00+00:00".to_string()),
+                policy_id: Some(policy.policy_id),
+                device_policy_id: Some(format!("{}/source", policy.policy_id)),
+                version: Some(policy.desired_version),
+                role: Some(crate::gateway_policy::DevicePolicyRole::ClientGatewayViaPeer),
+                status: Some("active".to_string()),
                 observed_policy_id: Some(policy.policy_id),
                 observed_policy_version: Some(policy.desired_version),
                 observed_policy_status: Some("active".to_string()),
@@ -665,5 +699,62 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].machine_id, source);
         assert_eq!(reports[0].easytier_ipv4.as_deref(), Some("10.126.126.2"));
+    }
+
+    #[tokio::test]
+    async fn test_gateway_reports_keep_machine_latest_and_policy_role_rows() {
+        let db = Db::memory_db().await;
+        let user_id = db.auto_create_user("gateway-report-user").await.unwrap().id;
+        let node = uuid::Uuid::new_v4();
+        let policy_a = uuid::Uuid::new_v4();
+        let policy_b = uuid::Uuid::new_v4();
+
+        for (policy_id, role, status) in [
+            (
+                policy_a,
+                crate::gateway_policy::DevicePolicyRole::ClientGatewayViaPeer,
+                "active",
+            ),
+            (
+                policy_b,
+                crate::gateway_policy::DevicePolicyRole::ProvideExitForGateway,
+                "prepared",
+            ),
+        ] {
+            db.upsert_gateway_runtime_report(
+                user_id,
+                RuntimeReport {
+                    machine_id: node,
+                    agent_version: "0.1.0".to_string(),
+                    easytier_ipv4: Some("10.126.126.2".to_string()),
+                    last_report_at: Some("2026-05-16T10:00:00+00:00".to_string()),
+                    policy_id: Some(policy_id),
+                    device_policy_id: Some(format!("{policy_id}/{status}")),
+                    version: Some(1),
+                    role: Some(role),
+                    status: Some(status.to_string()),
+                    observed_policy_id: Some(policy_id),
+                    observed_policy_version: Some(1),
+                    observed_policy_status: Some(status.to_string()),
+                    last_error: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let reports = db.list_gateway_runtime_reports(user_id).await.unwrap();
+
+        assert_eq!(reports.len(), 2);
+        assert!(reports.iter().any(|report| {
+            report.observed_policy_id == Some(policy_a)
+                && report.role
+                    == Some(crate::gateway_policy::DevicePolicyRole::ClientGatewayViaPeer)
+        }));
+        assert!(reports.iter().any(|report| {
+            report.observed_policy_id == Some(policy_b)
+                && report.role
+                    == Some(crate::gateway_policy::DevicePolicyRole::ProvideExitForGateway)
+        }));
     }
 }

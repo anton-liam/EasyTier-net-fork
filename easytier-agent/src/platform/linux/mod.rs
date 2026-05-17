@@ -56,6 +56,7 @@ impl LinuxBackend {
 
     fn source_apply(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
         let exit_peer = policy.exit_peer_ipv4.as_deref().unwrap_or_default();
+        let easytier_iface = policy.easytier_iface.as_str();
         let mut commands = vec![
             CommandPlan::new("ip", ["route", "show", "default"]),
             CommandPlan::new(
@@ -67,7 +68,7 @@ impl LinuxBackend {
                     "via",
                     exit_peer,
                     "dev",
-                    "easytier0",
+                    easytier_iface,
                     "table",
                     &self.table_id.to_string(),
                 ],
@@ -131,6 +132,9 @@ impl LinuxBackend {
     fn source_cleanup(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
         let mut commands = Vec::new();
         for cidr in &policy.managed_cidrs {
+            if cidr.trim() == "0.0.0.0/0" {
+                continue;
+            }
             commands.push(CommandPlan::new(
                 "ip",
                 [
@@ -162,6 +166,8 @@ impl LinuxBackend {
     }
 
     fn exit_apply(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
+        let easytier_iface = policy.easytier_iface.as_str();
+        let source_peer = policy.source_peer_ipv4.as_deref().unwrap_or_default();
         let nft_table = &self.nft_table;
         let postrouting_chain = format!(
             "nft list chain inet {nft_table} postrouting >/dev/null 2>&1 || nft add chain inet {nft_table} postrouting '{{ type nat hook postrouting priority srcnat; }}'"
@@ -184,7 +190,7 @@ impl LinuxBackend {
                     &self.nft_table,
                     "forward",
                     "iifname",
-                    "easytier0",
+                    easytier_iface,
                     "accept",
                     "comment",
                     &policy.device_policy_id,
@@ -195,6 +201,24 @@ impl LinuxBackend {
         commands.push(
             self.delete_nft_rules_by_comment_command("postrouting", &policy.device_policy_id),
         );
+        if policy.include_device_traffic {
+            commands.push(CommandPlan::new(
+                "nft",
+                [
+                    "add",
+                    "rule",
+                    "inet",
+                    &self.nft_table,
+                    "postrouting",
+                    "ip",
+                    "saddr",
+                    &format!("{source_peer}/32"),
+                    "masquerade",
+                    "comment",
+                    &policy.device_policy_id,
+                ],
+            ));
+        }
         for cidr in &policy.managed_cidrs {
             commands.push(CommandPlan::new(
                 "nft",
@@ -213,6 +237,20 @@ impl LinuxBackend {
                 ],
             ));
         }
+        for cidr in &policy.managed_cidrs {
+            commands.push(CommandPlan::new(
+                "ip",
+                [
+                    "route",
+                    "replace",
+                    cidr,
+                    "via",
+                    source_peer,
+                    "dev",
+                    easytier_iface,
+                ],
+            ));
+        }
 
         commands
     }
@@ -222,6 +260,15 @@ impl LinuxBackend {
             self.delete_nft_rules_by_comment_command("postrouting", &policy.device_policy_id),
             self.delete_nft_rules_by_comment_command("forward", &policy.device_policy_id),
         ]
+        .into_iter()
+        .chain(
+            policy
+                .managed_cidrs
+                .iter()
+                .filter(|cidr| cidr.trim() != "0.0.0.0/0")
+                .map(|cidr| CommandPlan::new("ip", ["route", "del", cidr])),
+        )
+        .collect()
     }
 }
 
@@ -264,6 +311,7 @@ mod tests {
             exit_machine_id: "node-b".to_string(),
             exit_peer_ipv4: Some("10.126.126.3".to_string()),
             source_peer_ipv4: Some("10.126.126.2".to_string()),
+            easytier_iface: "easytier0".to_string(),
             exit_egress: ExitEgress {
                 mode: ExitEgressMode::Auto,
                 iface: None,
@@ -340,6 +388,42 @@ mod tests {
     }
 
     #[test]
+    fn exit_apply_adds_nat_for_source_peer_when_device_traffic_enabled() {
+        let backend = LinuxBackend::default();
+        let mut policy = policy(DevicePolicyRole::ProvideExitForGateway);
+        policy.managed_cidrs.clear();
+        policy.include_device_traffic = true;
+
+        let commands = backend.plan_apply(&policy).unwrap();
+
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "nft" && cmd.args.contains(&"10.126.126.2/32".to_string())
+        }));
+    }
+
+    #[test]
+    fn exit_apply_routes_managed_cidrs_back_to_source_peer() {
+        let backend = LinuxBackend::default();
+        let commands = backend
+            .plan_apply(&policy(DevicePolicyRole::ProvideExitForGateway))
+            .unwrap();
+
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "ip"
+                && cmd.args
+                    == [
+                        "route".to_string(),
+                        "replace".to_string(),
+                        "192.168.10.0/24".to_string(),
+                        "via".to_string(),
+                        "10.126.126.2".to_string(),
+                        "dev".to_string(),
+                        "easytier0".to_string(),
+                    ]
+        }));
+    }
+
+    #[test]
     fn exit_apply_prepares_nft_table_and_chain_idempotently() {
         let backend = LinuxBackend::default();
         let commands = backend
@@ -394,11 +478,11 @@ mod tests {
     }
 
     #[test]
-    fn exit_apply_allows_forwarding_from_easytier_interface() {
+    fn exit_apply_allows_forwarding_from_configured_easytier_interface() {
         let backend = LinuxBackend::default();
-        let commands = backend
-            .plan_apply(&policy(DevicePolicyRole::ProvideExitForGateway))
-            .unwrap();
+        let mut policy = policy(DevicePolicyRole::ProvideExitForGateway);
+        policy.easytier_iface = "easytierw0".to_string();
+        let commands = backend.plan_apply(&policy).unwrap();
         let shell_commands = commands
             .iter()
             .filter(|cmd| cmd.program == "sh")
@@ -417,7 +501,7 @@ mod tests {
                     window
                         == [
                             "iifname".to_string(),
-                            "easytier0".to_string(),
+                            "easytierw0".to_string(),
                             "accept".to_string(),
                         ]
                 })
@@ -434,8 +518,16 @@ mod tests {
         assert!(
             commands
                 .iter()
+                .filter(|command| command.program == "sh")
                 .all(|command| command.args.contains(&"p1/source".to_string()))
         );
+        assert!(commands.iter().any(|command| command.program == "ip"
+            && command.args
+                == [
+                    "route".to_string(),
+                    "del".to_string(),
+                    "192.168.10.0/24".to_string(),
+                ]));
         assert!(
             commands
                 .iter()

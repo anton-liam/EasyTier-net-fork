@@ -23,7 +23,7 @@ use tokio::sync::RwLock;
 use crate::FeatureFlags;
 use crate::gateway_policy::{
     DevicePolicy, GatewayFullTunnelPolicy, GatewayPolicyNode, GatewayPolicySnapshot, PolicyStore,
-    RuntimeReport,
+    RuntimeReport, apply_gateway_policy_to_native_network_configs,
 };
 use crate::webhook::SharedWebhookConfig;
 use tokio::task::JoinSet;
@@ -230,7 +230,54 @@ impl ClientManager {
         self.gateway_policy_store
             .write()
             .await
-            .upsert_policy(user_id, policy)?;
+            .upsert_policy(user_id, policy.clone())?;
+        if policy.enabled
+            && let Err(error) = self
+                .sync_gateway_policy_to_native_networks(user_id, &policy)
+                .await
+        {
+            tracing::warn!(%error, policy_id = %policy.policy_id, "failed to sync gateway policy to native EasyTier configs");
+        }
+        Ok(())
+    }
+
+    async fn sync_gateway_policy_to_native_networks(
+        &self,
+        user_id: UserIdInDb,
+        policy: &GatewayFullTunnelPolicy,
+    ) -> Result<(), anyhow::Error> {
+        let store = self.gateway_policy_store(user_id).await?;
+        let exit_peer_ipv4 = store
+            .device_policies_for_machine(user_id, policy.source_machine_id)?
+            .into_iter()
+            .find(|device_policy| device_policy.policy_id == policy.policy_id)
+            .and_then(|device_policy| device_policy.exit_peer_ipv4)
+            .ok_or_else(|| anyhow::anyhow!("exit peer IPv4 is not ready"))?;
+
+        let mut source_config = self
+            .handle_get_network_config(
+                (user_id, policy.source_machine_id),
+                policy.network_instance_id,
+            )
+            .await?;
+        let mut exit_config = self
+            .handle_get_network_config(
+                (user_id, policy.exit_machine_id),
+                policy.network_instance_id,
+            )
+            .await?;
+
+        apply_gateway_policy_to_native_network_configs(
+            policy,
+            &mut source_config,
+            &mut exit_config,
+            &exit_peer_ipv4,
+        );
+
+        self.handle_run_network_instance((user_id, policy.source_machine_id), source_config, true)
+            .await?;
+        self.handle_run_network_instance((user_id, policy.exit_machine_id), exit_config, true)
+            .await?;
         Ok(())
     }
 

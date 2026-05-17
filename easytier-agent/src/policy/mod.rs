@@ -41,6 +41,8 @@ pub struct DevicePolicy {
     pub exit_peer_ipv4: Option<String>,
     #[serde(default)]
     pub source_peer_ipv4: Option<String>,
+    #[serde(default = "default_easytier_iface")]
+    pub easytier_iface: String,
     #[serde(default)]
     pub exit_egress: ExitEgress,
     #[serde(default = "default_true")]
@@ -121,6 +123,9 @@ impl DevicePolicy {
                 return Err(PolicyError::InvalidManagedCidr(cidr.clone()));
             }
         }
+        if self.easytier_iface.trim().is_empty() {
+            return Err(PolicyError::MissingField("easytier_iface"));
+        }
         match self.role {
             DevicePolicyRole::ClientGatewayViaPeer => {
                 require_ip(self.exit_peer_ipv4.as_deref(), "exit_peer_ipv4")?;
@@ -153,6 +158,10 @@ fn require_ip(value: Option<&str>, field: &'static str) -> Result<(), PolicyErro
 
 fn default_true() -> bool {
     true
+}
+
+pub fn default_easytier_iface() -> String {
+    "easytier0".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -207,6 +216,7 @@ mod tests {
         assert_eq!(policy.role, DevicePolicyRole::ClientGatewayViaPeer);
         assert_eq!(policy.managed_cidrs, vec!["192.168.10.0/24"]);
         policy.validate().unwrap();
+        assert_eq!(policy.easytier_iface, "easytier0");
     }
 
     #[test]
@@ -222,6 +232,19 @@ mod tests {
         policy.managed_cidrs.clear();
         policy.include_device_traffic = false;
         assert_eq!(policy.validate(), Err(PolicyError::NoManagedTraffic));
+    }
+
+    #[test]
+    fn accepts_exit_policy_for_source_device_traffic_only() {
+        let mut policy: DevicePolicy = serde_json::from_str(&source_policy_json()).unwrap();
+        policy.role = DevicePolicyRole::ProvideExitForGateway;
+        policy.device_policy_id = "p1/exit".to_string();
+        policy.managed_cidrs.clear();
+        policy.include_device_traffic = true;
+        policy.exit_peer_ipv4 = None;
+        policy.source_peer_ipv4 = Some("10.126.126.2".to_string());
+
+        policy.validate().unwrap();
     }
 
     #[test]

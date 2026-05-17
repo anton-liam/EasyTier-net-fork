@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { Button, Card, Column, DataTable, Drawer, ProgressSpinner, Tag, useToast } from 'primevue';
 import { Utils } from 'easytier-frontend-lib';
+import { useI18n } from 'vue-i18n';
 import ApiClient, { type GatewayFullTunnelPolicy, type GatewayPolicyNode, type GatewayPolicySnapshot } from '../modules/api';
 import GatewayPolicyEditor from './GatewayPolicyEditor.vue';
 
@@ -9,13 +10,17 @@ type DeviceOption = { label: string; value: string; networkIds: string[] };
 
 const props = defineProps<{ api?: ApiClient }>();
 const toast = useToast();
+const { t } = useI18n();
 
 const policies = ref<GatewayPolicySnapshot[] | undefined>(undefined);
 const devices = ref<DeviceOption[]>([]);
+const gatewayNodes = ref<GatewayPolicyNode[]>([]);
 const selectedPolicy = ref<GatewayPolicySnapshot | null>(null);
 const detailVisible = ref(false);
 const editorVisible = ref(false);
 const editingPolicy = ref<GatewayPolicySnapshot | null>(null);
+const initialSourceMachineId = ref('');
+const initialExitMachineId = ref('');
 const loading = computed(() => policies.value === undefined);
 
 const statusSeverity = (status?: string | null) => {
@@ -26,13 +31,14 @@ const statusSeverity = (status?: string | null) => {
     return 'info';
 };
 
-const boolLabel = (value: boolean) => value ? '是' : '否';
+const boolLabel = (value: boolean) => value ? t('web.common.enable') : t('web.common.disable');
 const shortId = (value?: string | null) => value ? value.slice(0, 8) : '-';
 const lastError = (policy: GatewayPolicySnapshot) => policy.observed.source?.last_error || policy.observed.exit?.last_error || '';
 const versionAligned = (policy: GatewayPolicySnapshot) => {
     const desired = policy.desired.desired_version;
     return policy.observed.source?.version === desired && policy.observed.exit?.version === desired;
 };
+const staleAfterMs = 120_000;
 const AGENT_REPORTED_NETWORK_ID = '00000000-0000-0000-0000-000000000000';
 
 const deviceOptions = computed(() => devices.value);
@@ -53,7 +59,9 @@ const loadDevices = async () => {
             networkIds: device.running_network_instances || [],
         }));
 
-    const nodeOptions = (await props.api.list_gateway_nodes())
+    const nodes = await props.api.list_gateway_nodes();
+    gatewayNodes.value = nodes;
+    const nodeOptions = nodes
         .filter((node: GatewayPolicyNode) => !!node.machine_id)
         .map((node: GatewayPolicyNode) => ({
             label: `Agent ${node.easytier_ipv4 || 'unknown'} (${shortId(node.machine_id)})`,
@@ -67,18 +75,38 @@ const loadDevices = async () => {
     devices.value = Array.from(merged.values());
 };
 
-const reloadAll = async () => {
-    await Promise.all([loadPolicies(), loadDevices()]);
+const isNodeFresh = (node?: GatewayPolicyNode | null) => {
+    if (!node) return false;
+    if (!node.last_report_at) return false;
+    const ts = Date.parse(node.last_report_at);
+    if (Number.isNaN(ts)) return false;
+    return Date.now() - ts <= staleAfterMs;
 };
+
+const policyValid = (policy: GatewayPolicySnapshot) => {
+    const source = gatewayNodes.value.find((node) => node.machine_id === policy.desired.source_machine_id);
+    const exit = gatewayNodes.value.find((node) => node.machine_id === policy.desired.exit_machine_id);
+    return !!source && !!exit && isNodeFresh(source) && isNodeFresh(exit) && source.status !== 'rollbacking' && exit.status !== 'rollbacking';
+};
+
+const policyValidityLabel = (policy: GatewayPolicySnapshot) => policyValid(policy) ? t('web.gateway_policy.valid') : t('web.gateway_policy.invalid');
 
 const openCreate = () => {
     editingPolicy.value = null;
+    initialSourceMachineId.value = '';
+    initialExitMachineId.value = '';
     editorVisible.value = true;
 };
 
 const openEdit = (policy: GatewayPolicySnapshot) => {
     editingPolicy.value = policy;
+    initialSourceMachineId.value = '';
+    initialExitMachineId.value = '';
     editorVisible.value = true;
+};
+
+const reloadAll = async () => {
+    await Promise.all([loadPolicies(), loadDevices()]);
 };
 
 const clonePolicyWith = (policy: GatewayPolicySnapshot, patch: Partial<GatewayFullTunnelPolicy>): GatewayFullTunnelPolicy => ({
@@ -89,13 +117,13 @@ const clonePolicyWith = (policy: GatewayPolicySnapshot, patch: Partial<GatewayFu
 
 const setPolicyEnabled = async (policy: GatewayPolicySnapshot, enabled: boolean) => {
     if (!props.api) return;
-    if (enabled && !window.confirm('启用策略会改变目标节点的 desired state，实际流量切换结果以 observed 状态为准。确认启用？')) return;
+    if (enabled && !window.confirm(t('web.gateway_policy.confirm_enable_policy'))) return;
     await props.api.upsert_gateway_policy(clonePolicyWith(policy, { enabled }));
     await reloadAll();
 };
 
 const confirmEdit = (policy: GatewayPolicySnapshot) => {
-    if (policy.desired.enabled && !window.confirm('编辑已启用策略可能触发出口切换。Web 只修改 desired state，是否完成请以 observed source/exit 状态为准。确认继续？')) return;
+    if (policy.desired.enabled && !window.confirm(t('web.gateway_policy.confirm_edit_enabled_policy'))) return;
     openEdit(policy);
 };
 
@@ -108,7 +136,7 @@ const periodFunc = new Utils.PeriodicTask(async () => {
     try {
         await reloadAll();
     } catch (e) {
-        toast.add({ severity: 'error', summary: '加载出口策略失败', detail: String(e), life: 2000 });
+        toast.add({ severity: 'error', summary: t('web.gateway_policy.load_failed'), detail: String(e), life: 2000 });
         console.error(e);
     }
 }, 1500);
@@ -121,12 +149,12 @@ onUnmounted(() => periodFunc.stop());
     <div class="space-y-4">
         <div class="flex items-center justify-between gap-3">
             <div>
-                <h1 class="text-xl font-semibold text-gray-900 dark:text-gray-100">出口策略</h1>
-                <p class="text-sm text-gray-500 dark:text-gray-400">查看 source R3S 到 exit R3S 的全流量转发策略和 Agent 实际上报状态。</p>
+                <h1 class="text-xl font-semibold text-gray-900 dark:text-gray-100">{{ t('web.gateway_policy.title') }}</h1>
+                <p class="text-sm text-gray-500 dark:text-gray-400">{{ t('web.gateway_policy.console_description') }}</p>
             </div>
             <div class="flex items-center gap-2">
                 <Button icon="pi pi-refresh" severity="secondary" rounded @click="reloadAll" />
-                <Button icon="pi pi-plus" label="创建策略" @click="openCreate" />
+                <Button icon="pi pi-plus" :label="t('web.gateway_policy.create_policy')" @click="openCreate" />
             </div>
         </div>
 
@@ -136,13 +164,18 @@ onUnmounted(() => periodFunc.stop());
                     <ProgressSpinner />
                 </div>
                 <div v-else-if="policies?.length === 0" class="py-10 text-center text-gray-500">
-                    <div class="text-base font-medium">还没有出口策略</div>
-                    <div class="text-sm mt-1">创建一条策略后，可以把任意 source R3S 的受管流量切到任意 exit R3S。</div>
+                    <div class="text-base font-medium">{{ t('web.gateway_policy.empty_title') }}</div>
+                    <div class="text-sm mt-1">{{ t('web.gateway_policy.empty_description') }}</div>
                 </div>
                 <DataTable v-else :value="policies" dataKey="desired.policy_id" stripedRows responsiveLayout="scroll">
-                    <Column header="启用">
+                    <Column :header="t('web.gateway_policy.enabled_column')">
                         <template #body="slotProps">
-                            <Tag :severity="slotProps.data.desired.enabled ? 'success' : 'secondary'" :value="slotProps.data.desired.enabled ? '启用' : '停用'" />
+                            <Tag :severity="slotProps.data.desired.enabled ? 'success' : 'secondary'" :value="slotProps.data.desired.enabled ? t('web.common.enable') : t('web.common.disable')" />
+                        </template>
+                    </Column>
+                    <Column :header="t('web.gateway_policy.policy_status')">
+                        <template #body="slotProps">
+                            <Tag :severity="policyValid(slotProps.data) ? 'success' : 'danger'" :value="policyValidityLabel(slotProps.data)" />
                         </template>
                     </Column>
                     <Column header="Source">
@@ -151,33 +184,33 @@ onUnmounted(() => periodFunc.stop());
                     <Column header="Exit">
                         <template #body="slotProps">{{ shortId(slotProps.data.desired.exit_machine_id) }}</template>
                     </Column>
-                    <Column header="受管网段">
+                    <Column :header="t('web.gateway_policy.managed_cidrs_column')">
                         <template #body="slotProps">{{ slotProps.data.desired.managed_cidrs.join(', ') || '-' }}</template>
                     </Column>
-                    <Column header="设备流量">
+                    <Column :header="t('web.gateway_policy.device_traffic_label')">
                         <template #body="slotProps">{{ boolLabel(slotProps.data.desired.include_device_traffic) }}</template>
                     </Column>
-                    <Column header="Source 状态">
+                    <Column :header="t('web.gateway_policy.source_status')">
                         <template #body="slotProps">
                             <Tag :severity="statusSeverity(slotProps.data.observed.source?.status)" :value="slotProps.data.observed.source?.status || 'unknown'" />
                         </template>
                     </Column>
-                    <Column header="Exit 状态">
+                    <Column :header="t('web.gateway_policy.exit_status')">
                         <template #body="slotProps">
                             <Tag :severity="statusSeverity(slotProps.data.observed.exit?.status)" :value="slotProps.data.observed.exit?.status || 'unknown'" />
                         </template>
                     </Column>
-                    <Column header="版本">
+                    <Column :header="t('web.gateway_policy.version')">
                         <template #body="slotProps">
                             <Tag :severity="versionAligned(slotProps.data) ? 'success' : 'warn'" :value="slotProps.data.desired.desired_version" />
                         </template>
                     </Column>
-                    <Column header="最近错误">
+                    <Column :header="t('web.gateway_policy.last_error')">
                         <template #body="slotProps">
                             <span class="text-sm text-red-600 break-all">{{ lastError(slotProps.data) || '-' }}</span>
                         </template>
                     </Column>
-                    <Column header="操作">
+                    <Column :header="t('web.gateway_policy.actions')">
                         <template #body="slotProps">
                             <div class="flex items-center gap-2">
                                 <Button icon="pi pi-eye" severity="secondary" rounded @click="openDetails(slotProps.data)" />
@@ -195,7 +228,7 @@ onUnmounted(() => periodFunc.stop());
             </template>
         </Card>
 
-        <Drawer v-model:visible="detailVisible" position="right" class="w-full md:w-2/5" header="策略详情">
+        <Drawer v-model:visible="detailVisible" position="right" class="w-full md:w-2/5" :header="t('web.gateway_policy.policy_detail')">
             <div v-if="selectedPolicy" class="space-y-4 text-sm">
                 <section>
                     <h2 class="font-semibold mb-2">Desired</h2>
@@ -224,6 +257,8 @@ onUnmounted(() => periodFunc.stop());
             :api="api"
             :devices="deviceOptions"
             :policy="editingPolicy"
+            :initial-source-machine-id="initialSourceMachineId"
+            :initial-exit-machine-id="initialExitMachineId"
             @saved="reloadAll"
         />
     </div>

@@ -347,6 +347,100 @@ web:
     select_existing_network_or_create_new: 选择现有网络实例或创建新网络以管理网络设置
     disable_network: 禁用网络
 
+  gateway_policy:
+    title: 出口策略
+    description: 基于当前已运行的 EasyTier network instance 设置入口到出口的转发。
+    console_description: 查看 source R3S 到 exit R3S 的全流量转发策略和 Agent 实际上报状态。
+    topology_button: 拓扑图
+    configure_button: 设置出口策略
+    topology_title: 出口策略拓扑
+    create_policy: 创建出口策略
+    edit_policy: 编辑出口策略
+    source_node: 入口节点
+    exit_node: 出口节点
+    current_node: 当前节点
+    normal_node: 普通节点
+    control_plane: 控制面
+    control_link: control / config-server
+    gateway_link: gateway_full_tunnel
+    nat_egress: NAT / egress
+    exit_network: 出口网络
+    underlay_egress: underlay egress
+    legend_control: 控制面搭线
+    legend_peer: EasyTier peer
+    legend_gateway: 出口策略流量
+    status_not_configured: 未配置
+    status_disabled: 未启用
+    status_waiting_report: 等待 Agent 上报
+    status_version_mismatch: 版本未对齐
+    status_applied: 已应用
+    status_needs_check: 需检查
+    no_policy_for_instance: 当前入口节点和 network instance 尚未创建出口策略
+    device_traffic: 设备自身流量
+    device_traffic_label: 设备流量
+    current_source_policy: 当前入口策略
+    ingress_iface: 入口接口
+    test_exit: 测试出口
+    exit_egress: 出口接口
+    desired: Desired
+    observed: Observed
+    exit_test_result: 出口测试结果
+    enabled: 已启用
+    policy_disabled: 策略未启用
+    running_current_network: 已运行当前网络
+    source_not_in_network: 入口节点未出现在当前网络实例中
+    exit_not_in_network: 出口节点未出现在当前网络实例中
+    source_ipv4_missing: 入口节点尚未上报 EasyTier IPv4
+    exit_ipv4_missing: 出口节点尚未上报 EasyTier IPv4
+    source_status_is: 入口状态为
+    exit_status_is: 出口状态为
+    managed_scope_ok: 已配置受管网段或包含设备自身流量
+    managed_scope_empty: 受管网段为空且未包含设备自身流量
+    check_policy_enabled: 策略启用
+    check_source_online: 入口节点在线
+    check_exit_online: 出口节点在线
+    check_source_ipv4: 入口 EasyTier IPv4
+    check_exit_ipv4: 出口 EasyTier IPv4
+    check_source_status: 入口策略状态
+    check_exit_status: 出口策略状态
+    check_source_version: 入口版本对齐
+    check_exit_version: 出口版本对齐
+    check_managed_scope: 受管流量范围
+    network_instance_id: Network Instance ID
+    select_common_network: 选择入口/出口共同网络实例
+    managed_cidrs: 受管网段，每行一个
+    ingress_ifaces: 入口接口，可空，每行一个
+    include_device_traffic: 包含设备自身普通出站流量
+    enable_policy: 启用策略
+    error_select_source: 请选择入口节点
+    error_select_exit: 请选择出口节点
+    error_same_source_exit: 入口节点和出口节点不能相同
+    error_no_common_network: 入口节点和出口节点没有共同的 EasyTier network instance
+    error_select_network: 请选择 EasyTier network instance id
+    error_empty_scope: 受管网段为空时必须包含设备自身流量
+    disabled_not_connected: 节点未连接 Web 控制台
+    disabled_select_network: 请选择一个 EasyTier network instance
+    disabled_network_not_running: 当前网络尚未运行成功
+    disabled_network_error: "当前网络状态异常：{error}"
+    disabled_node_not_in_network: 当前节点未运行该网络实例
+    disabled_no_exit_peer: 当前网络未发现可作为出口的对端节点
+    valid: 有效
+    invalid: 无效
+    confirm_enable_policy: 启用策略会改变目标节点的 desired state，实际流量切换结果以 observed 状态为准。确认启用？
+    confirm_edit_enabled_policy: 编辑已启用策略可能触发出口切换。Web 只修改 desired state，是否完成请以 observed source/exit 状态为准。确认继续？
+    load_failed: 加载出口策略失败
+    empty_title: 还没有出口策略
+    empty_description: 创建一条策略后，可以把任意 source R3S 的受管流量切到任意 exit R3S。
+    enabled_column: 启用
+    policy_status: 策略状态
+    managed_cidrs_column: 受管网段
+    source_status: Source 状态
+    exit_status: Exit 状态
+    version: 版本
+    last_error: 最近错误
+    actions: 操作
+    policy_detail: 策略详情
+
   network:
     title: 网络
     create: 创建网络

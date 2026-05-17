@@ -119,6 +119,9 @@ impl GatewayPolicyApi {
         Json(mut report): Json<RuntimeReport>,
     ) -> Result<StatusCode, HttpHandleError> {
         report.machine_id = machine_id;
+        if report.last_report_at.is_none() {
+            report.last_report_at = Some(chrono::Local::now().fixed_offset().to_rfc3339());
+        }
         client_mgr
             .update_gateway_runtime_report(user_id, report)
             .await
@@ -254,12 +257,7 @@ mod tests {
         .unwrap();
         let (serve_task, _session_cleanup_task) = server.start().await.unwrap();
 
-        (
-            format!("http://{}", http_addr),
-            db,
-            user_id,
-            serve_task,
-        )
+        (format!("http://{}", http_addr), db, user_id, serve_task)
     }
 
     #[tokio::test]
@@ -306,6 +304,24 @@ mod tests {
                 machine_id,
                 agent_version: "0.1.0".to_string(),
                 easytier_ipv4: Some(easytier_ipv4.to_string()),
+                last_report_at: Some("2026-05-16T10:00:00+00:00".to_string()),
+                policy_id: Some(policy.policy_id),
+                device_policy_id: Some(format!(
+                    "{}/{}",
+                    policy.policy_id,
+                    if machine_id == source {
+                        "source"
+                    } else {
+                        "exit"
+                    }
+                )),
+                version: Some(policy.desired_version),
+                role: Some(if machine_id == source {
+                    crate::gateway_policy::DevicePolicyRole::ClientGatewayViaPeer
+                } else {
+                    crate::gateway_policy::DevicePolicyRole::ProvideExitForGateway
+                }),
+                status: Some(status.to_string()),
                 observed_policy_id: Some(policy.policy_id),
                 observed_policy_version: Some(policy.desired_version),
                 observed_policy_status: Some(status.to_string()),
@@ -335,7 +351,10 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.status(), StatusCode::OK);
         let snapshot_body = snapshot.json::<serde_json::Value>().await.unwrap();
-        assert_eq!(snapshot_body["desired"]["policy_id"], policy.policy_id.to_string());
+        assert_eq!(
+            snapshot_body["desired"]["policy_id"],
+            policy.policy_id.to_string()
+        );
         assert_eq!(snapshot_body["observed"]["source"]["status"], "active");
         assert_eq!(snapshot_body["observed"]["exit"]["status"], "prepared");
 
@@ -365,7 +384,10 @@ mod tests {
             .unwrap();
         assert_eq!(list.status(), StatusCode::OK);
         let list_body = list.json::<serde_json::Value>().await.unwrap();
-        assert_eq!(list_body[0]["desired"]["policy_id"], policy.policy_id.to_string());
+        assert_eq!(
+            list_body[0]["desired"]["policy_id"],
+            policy.policy_id.to_string()
+        );
         assert_eq!(list_body[0]["observed"]["source"]["status"], "active");
 
         let source_device_policies = client

@@ -49,9 +49,8 @@ impl PolicyReconciler {
             let observed = self.observed_versions.get(&policy.device_policy_id);
             let version_changed = observed.map(|observed| observed.version) != Some(policy.version);
             let reapply_due = observed.is_some_and(|observed| {
-                reapply_interval.is_some_and(|interval| {
-                    now.duration_since(observed.applied_at) >= interval
-                })
+                reapply_interval
+                    .is_some_and(|interval| now.duration_since(observed.applied_at) >= interval)
             });
             if version_changed || reapply_due {
                 self.observed_versions.insert(
@@ -96,6 +95,7 @@ mod tests {
             exit_machine_id: "node-b".to_string(),
             exit_peer_ipv4: Some("10.126.126.3".to_string()),
             source_peer_ipv4: None,
+            easytier_iface: "easytier0".to_string(),
             exit_egress: ExitEgress::default(),
             protect_control_plane: true,
             rollback_enabled: true,

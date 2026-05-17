@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use easytier::launcher::NetworkConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GatewayFullTunnelPolicy {
     pub policy_id: Uuid,
@@ -44,6 +46,8 @@ pub struct DevicePolicy {
     pub exit_peer_ipv4: Option<String>,
     #[serde(default)]
     pub source_peer_ipv4: Option<String>,
+    #[serde(default = "default_easytier_iface")]
+    pub easytier_iface: String,
     #[serde(default)]
     pub exit_egress: ExitEgress,
     #[serde(default = "default_true")]
@@ -58,6 +62,18 @@ pub struct RuntimeReport {
     pub agent_version: String,
     #[serde(default)]
     pub easytier_ipv4: Option<String>,
+    #[serde(default)]
+    pub last_report_at: Option<String>,
+    #[serde(default)]
+    pub policy_id: Option<Uuid>,
+    #[serde(default)]
+    pub device_policy_id: Option<String>,
+    #[serde(default)]
+    pub version: Option<u64>,
+    #[serde(default)]
+    pub role: Option<DevicePolicyRole>,
+    #[serde(default)]
+    pub status: Option<String>,
     #[serde(default)]
     pub observed_policy_id: Option<Uuid>,
     #[serde(default)]
@@ -89,6 +105,8 @@ pub struct GatewayPolicyObservedNode {
     #[serde(default)]
     pub easytier_ipv4: Option<String>,
     #[serde(default)]
+    pub last_report_at: Option<String>,
+    #[serde(default)]
     pub policy_id: Option<Uuid>,
     #[serde(default)]
     pub version: Option<u64>,
@@ -103,6 +121,8 @@ pub struct GatewayPolicyNode {
     pub agent_version: String,
     #[serde(default)]
     pub easytier_ipv4: Option<String>,
+    #[serde(default)]
+    pub last_report_at: Option<String>,
     pub status: String,
     #[serde(default)]
     pub last_error: Option<String>,
@@ -112,9 +132,10 @@ pub struct GatewayPolicyNode {
 pub struct PolicyStore {
     policies: HashMap<(i32, Uuid), GatewayFullTunnelPolicy>,
     reports: HashMap<(i32, Uuid), RuntimeReport>,
+    policy_reports: HashMap<(i32, Uuid, DevicePolicyRole, Uuid), RuntimeReport>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum DevicePolicyRole {
     ClientGatewayViaPeer,
@@ -220,6 +241,7 @@ impl GatewayFullTunnelPolicy {
             exit_machine_id: self.exit_machine_id,
             exit_peer_ipv4: Some(exit_peer_ipv4),
             source_peer_ipv4: None,
+            easytier_iface: default_easytier_iface(),
             exit_egress: self.exit_egress.clone(),
             protect_control_plane: self.protect_control_plane,
             rollback_enabled: self.rollback.enabled,
@@ -243,10 +265,11 @@ impl GatewayFullTunnelPolicy {
             source_machine_id: self.source_machine_id,
             managed_cidrs: self.managed_cidrs.clone(),
             ingress_ifaces: Vec::new(),
-            include_device_traffic: false,
+            include_device_traffic: self.include_device_traffic,
             exit_machine_id: self.exit_machine_id,
             exit_peer_ipv4: None,
             source_peer_ipv4: Some(source_peer_ipv4),
+            easytier_iface: default_easytier_iface(),
             exit_egress: self.exit_egress.clone(),
             protect_control_plane: self.protect_control_plane,
             rollback_enabled: self.rollback.enabled,
@@ -272,6 +295,27 @@ pub fn validate_policy_conflicts(
     Ok(())
 }
 
+pub fn apply_gateway_policy_to_native_network_configs(
+    policy: &GatewayFullTunnelPolicy,
+    source_config: &mut NetworkConfig,
+    exit_config: &mut NetworkConfig,
+    exit_peer_ipv4: &str,
+) {
+    for cidr in &policy.managed_cidrs {
+        if !source_config.proxy_cidrs.contains(cidr) {
+            source_config.proxy_cidrs.push(cidr.clone());
+        }
+    }
+    if !source_config
+        .exit_nodes
+        .contains(&exit_peer_ipv4.to_string())
+    {
+        source_config.exit_nodes = vec![exit_peer_ipv4.to_string()];
+    }
+    exit_config.enable_exit_node = Some(true);
+    exit_config.proxy_forward_by_system = Some(true);
+}
+
 impl PolicyStore {
     pub fn upsert_policy(
         &mut self,
@@ -291,7 +335,33 @@ impl PolicyStore {
     }
 
     pub fn update_report(&mut self, user_id: i32, report: RuntimeReport) {
+        if let Some((policy_id, role)) = self.report_policy_role(user_id, &report) {
+            self.policy_reports.insert(
+                (user_id, policy_id, role, report.machine_id),
+                report.clone(),
+            );
+        }
         self.reports.insert((user_id, report.machine_id), report);
+    }
+
+    fn report_policy_role(
+        &self,
+        user_id: i32,
+        report: &RuntimeReport,
+    ) -> Option<(Uuid, DevicePolicyRole)> {
+        let policy_id = report.observed_policy_id.or(report.policy_id)?;
+        if let Some(role) = report.role {
+            return Some((policy_id, role));
+        }
+
+        let policy = self.policies.get(&(user_id, policy_id))?;
+        if report.machine_id == policy.source_machine_id {
+            return Some((policy_id, DevicePolicyRole::ClientGatewayViaPeer));
+        }
+        if report.machine_id == policy.exit_machine_id {
+            return Some((policy_id, DevicePolicyRole::ProvideExitForGateway));
+        }
+        None
     }
 
     pub fn list_policies(&self, user_id: i32) -> Vec<GatewayFullTunnelPolicy> {
@@ -328,12 +398,22 @@ impl PolicyStore {
     pub fn policy_snapshot(&self, user_id: i32, policy_id: Uuid) -> Option<GatewayPolicySnapshot> {
         let desired = self.policies.get(&(user_id, policy_id))?.clone();
         let source = self
-            .reports
-            .get(&(user_id, desired.source_machine_id))
+            .policy_reports
+            .get(&(
+                user_id,
+                policy_id,
+                DevicePolicyRole::ClientGatewayViaPeer,
+                desired.source_machine_id,
+            ))
             .map(GatewayPolicyObservedNode::from);
         let exit = self
-            .reports
-            .get(&(user_id, desired.exit_machine_id))
+            .policy_reports
+            .get(&(
+                user_id,
+                policy_id,
+                DevicePolicyRole::ProvideExitForGateway,
+                desired.exit_machine_id,
+            ))
             .map(GatewayPolicyObservedNode::from);
 
         Some(GatewayPolicySnapshot {
@@ -382,11 +462,13 @@ impl From<&RuntimeReport> for GatewayPolicyObservedNode {
             machine_id: report.machine_id,
             agent_version: report.agent_version.clone(),
             easytier_ipv4: report.easytier_ipv4.clone(),
-            policy_id: report.observed_policy_id,
-            version: report.observed_policy_version,
+            last_report_at: report.last_report_at.clone(),
+            policy_id: report.observed_policy_id.or(report.policy_id),
+            version: report.observed_policy_version.or(report.version),
             status: report
                 .observed_policy_status
                 .clone()
+                .or_else(|| report.status.clone())
                 .unwrap_or_else(|| "unknown".to_string()),
             last_error: report.last_error.clone(),
         }
@@ -399,17 +481,32 @@ impl From<&RuntimeReport> for GatewayPolicyNode {
             machine_id: report.machine_id,
             agent_version: report.agent_version.clone(),
             easytier_ipv4: report.easytier_ipv4.clone(),
+            last_report_at: report.last_report_at.clone(),
             status: report
                 .observed_policy_status
                 .clone()
+                .or_else(|| report.status.clone())
                 .unwrap_or_else(|| "unknown".to_string()),
             last_error: report.last_error.clone(),
         }
     }
 }
 
+impl DevicePolicyRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DevicePolicyRole::ClientGatewayViaPeer => "client_gateway_via_peer",
+            DevicePolicyRole::ProvideExitForGateway => "provide_exit_for_gateway",
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn default_easytier_iface() -> String {
+    "easytier0".to_string()
 }
 
 #[cfg(test)]
@@ -500,6 +597,35 @@ mod tests {
     }
 
     #[test]
+    fn native_network_config_sync_announces_source_cidrs_and_prepares_exit() {
+        let source = Uuid::new_v4();
+        let exit = Uuid::new_v4();
+        let policy = base_policy(source, exit);
+        let mut source_config = NetworkConfig {
+            proxy_cidrs: vec!["10.10.0.0/24".to_string()],
+            exit_nodes: vec!["10.126.126.9".to_string()],
+            ..Default::default()
+        };
+        let mut exit_config = NetworkConfig::default();
+
+        apply_gateway_policy_to_native_network_configs(
+            &policy,
+            &mut source_config,
+            &mut exit_config,
+            "10.126.126.3",
+        );
+
+        assert!(
+            source_config
+                .proxy_cidrs
+                .contains(&"192.168.10.0/24".to_string())
+        );
+        assert_eq!(source_config.exit_nodes, vec!["10.126.126.3"]);
+        assert_eq!(exit_config.enable_exit_node, Some(true));
+        assert_eq!(exit_config.proxy_forward_by_system, Some(true));
+    }
+
+    #[test]
     fn store_returns_device_policies_after_reports_are_ready() {
         let source = Uuid::new_v4();
         let exit = Uuid::new_v4();
@@ -517,6 +643,12 @@ mod tests {
                 machine_id: source,
                 agent_version: "0.1.0".to_string(),
                 easytier_ipv4: Some("10.126.126.2".to_string()),
+                last_report_at: Some("2026-05-16T10:00:00+00:00".to_string()),
+                policy_id: None,
+                device_policy_id: None,
+                version: None,
+                role: None,
+                status: None,
                 observed_policy_id: None,
                 observed_policy_version: None,
                 observed_policy_status: None,
@@ -529,6 +661,12 @@ mod tests {
                 machine_id: exit,
                 agent_version: "0.1.0".to_string(),
                 easytier_ipv4: Some("10.126.126.3".to_string()),
+                last_report_at: Some("2026-05-16T10:00:00+00:00".to_string()),
+                policy_id: None,
+                device_policy_id: None,
+                version: None,
+                role: None,
+                status: None,
                 observed_policy_id: None,
                 observed_policy_version: None,
                 observed_policy_status: None,
@@ -587,6 +725,12 @@ mod tests {
                 machine_id: source,
                 agent_version: "0.1.0".to_string(),
                 easytier_ipv4: Some("10.126.126.2".to_string()),
+                last_report_at: Some("2026-05-16T10:00:00+00:00".to_string()),
+                policy_id: Some(policy.policy_id),
+                device_policy_id: Some(format!("{}/source", policy.policy_id)),
+                version: Some(policy.desired_version),
+                role: Some(DevicePolicyRole::ClientGatewayViaPeer),
+                status: Some("active".to_string()),
                 observed_policy_id: Some(policy.policy_id),
                 observed_policy_version: Some(policy.desired_version),
                 observed_policy_status: Some("active".to_string()),
@@ -599,6 +743,12 @@ mod tests {
                 machine_id: exit,
                 agent_version: "0.1.0".to_string(),
                 easytier_ipv4: Some("10.126.126.3".to_string()),
+                last_report_at: Some("2026-05-16T10:00:00+00:00".to_string()),
+                policy_id: Some(policy.policy_id),
+                device_policy_id: Some(format!("{}/exit", policy.policy_id)),
+                version: Some(policy.desired_version),
+                role: Some(DevicePolicyRole::ProvideExitForGateway),
+                status: Some("prepared".to_string()),
                 observed_policy_id: Some(policy.policy_id),
                 observed_policy_version: Some(policy.desired_version),
                 observed_policy_status: Some("prepared".to_string()),
@@ -624,6 +774,99 @@ mod tests {
                 .as_ref()
                 .map(|node| node.status.as_str()),
             Some("prepared")
+        );
+    }
+
+    #[test]
+    fn store_keeps_observed_state_per_policy_role_when_machine_has_multiple_roles() {
+        let node_a = Uuid::new_v4();
+        let node_b = Uuid::new_v4();
+        let policy_a_to_b = base_policy(node_a, node_b);
+        let policy_b_to_a = base_policy(node_b, node_a);
+        let mut store = PolicyStore::default();
+        store.upsert_policy(1, policy_a_to_b.clone()).unwrap();
+        store.upsert_policy(1, policy_b_to_a.clone()).unwrap();
+
+        store.update_report(
+            1,
+            RuntimeReport {
+                machine_id: node_a,
+                agent_version: "0.1.0".to_string(),
+                easytier_ipv4: Some("10.77.77.2".to_string()),
+                last_report_at: Some("2026-05-16T10:00:01+00:00".to_string()),
+                policy_id: Some(policy_a_to_b.policy_id),
+                device_policy_id: Some(format!("{}/source", policy_a_to_b.policy_id)),
+                version: Some(policy_a_to_b.desired_version),
+                role: Some(DevicePolicyRole::ClientGatewayViaPeer),
+                status: Some("active".to_string()),
+                observed_policy_id: Some(policy_a_to_b.policy_id),
+                observed_policy_version: Some(policy_a_to_b.desired_version),
+                observed_policy_status: Some("active".to_string()),
+                last_error: None,
+            },
+        );
+        store.update_report(
+            1,
+            RuntimeReport {
+                machine_id: node_a,
+                agent_version: "0.1.0".to_string(),
+                easytier_ipv4: Some("10.77.77.2".to_string()),
+                last_report_at: Some("2026-05-16T10:00:02+00:00".to_string()),
+                policy_id: Some(policy_b_to_a.policy_id),
+                device_policy_id: Some(format!("{}/exit", policy_b_to_a.policy_id)),
+                version: Some(policy_b_to_a.desired_version),
+                role: Some(DevicePolicyRole::ProvideExitForGateway),
+                status: Some("prepared".to_string()),
+                observed_policy_id: Some(policy_b_to_a.policy_id),
+                observed_policy_version: Some(policy_b_to_a.desired_version),
+                observed_policy_status: Some("prepared".to_string()),
+                last_error: None,
+            },
+        );
+        store.update_report(
+            1,
+            RuntimeReport {
+                machine_id: node_b,
+                agent_version: "0.1.0".to_string(),
+                easytier_ipv4: Some("10.77.77.3".to_string()),
+                last_report_at: Some("2026-05-16T10:00:03+00:00".to_string()),
+                policy_id: Some(policy_a_to_b.policy_id),
+                device_policy_id: Some(format!("{}/exit", policy_a_to_b.policy_id)),
+                version: Some(policy_a_to_b.desired_version),
+                role: Some(DevicePolicyRole::ProvideExitForGateway),
+                status: Some("prepared".to_string()),
+                observed_policy_id: Some(policy_a_to_b.policy_id),
+                observed_policy_version: Some(policy_a_to_b.desired_version),
+                observed_policy_status: Some("prepared".to_string()),
+                last_error: None,
+            },
+        );
+
+        let snapshot = store.policy_snapshot(1, policy_a_to_b.policy_id).unwrap();
+
+        assert_eq!(
+            snapshot
+                .observed
+                .source
+                .as_ref()
+                .and_then(|node| node.policy_id),
+            Some(policy_a_to_b.policy_id)
+        );
+        assert_eq!(
+            snapshot
+                .observed
+                .source
+                .as_ref()
+                .and_then(|node| node.version),
+            Some(policy_a_to_b.desired_version)
+        );
+        assert_eq!(
+            snapshot
+                .observed
+                .source
+                .as_ref()
+                .map(|node| node.status.as_str()),
+            Some("active")
         );
     }
 }

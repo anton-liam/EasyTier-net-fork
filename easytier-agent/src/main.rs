@@ -39,6 +39,8 @@ enum Command {
         #[arg(long)]
         easytier_ipv4: Option<String>,
         #[arg(long)]
+        easytier_iface: Option<String>,
+        #[arg(long)]
         web_base_url: Option<String>,
         #[arg(long)]
         user_id: Option<i32>,
@@ -56,6 +58,8 @@ enum Command {
         machine_id: String,
         #[arg(long)]
         easytier_ipv4: Option<String>,
+        #[arg(long)]
+        easytier_iface: Option<String>,
         #[arg(long)]
         web_base_url: Option<String>,
         #[arg(long)]
@@ -79,6 +83,8 @@ enum Command {
         #[arg(long)]
         easytier_ipv4: Option<String>,
         #[arg(long)]
+        easytier_iface: Option<String>,
+        #[arg(long)]
         execute: bool,
     },
     Run {
@@ -94,6 +100,8 @@ enum Command {
         internal_auth_token: String,
         #[arg(long)]
         easytier_ipv4: Option<String>,
+        #[arg(long)]
+        easytier_iface: Option<String>,
         #[arg(long, default_value_t = 10)]
         interval_seconds: u64,
         #[arg(long)]
@@ -129,6 +137,7 @@ mod tests {
         let Command::Apply {
             machine_id,
             easytier_ipv4,
+            easytier_iface,
             web_base_url,
             user_id,
             internal_auth_token,
@@ -140,6 +149,7 @@ mod tests {
 
         assert_eq!(machine_id, "00000000-0000-0000-0000-000000000001");
         assert_eq!(easytier_ipv4.as_deref(), Some("10.126.126.2"));
+        assert!(easytier_iface.is_none());
         assert!(web_base_url.is_none());
         assert!(user_id.is_none());
         assert!(internal_auth_token.is_none());
@@ -346,13 +356,15 @@ fn main() -> anyhow::Result<()> {
             policy,
             machine_id,
             easytier_ipv4,
+            easytier_iface,
             web_base_url,
             user_id,
             internal_auth_token,
             execute,
             platform,
         } => {
-            let policy = read_policy(policy)?;
+            let mut policy = read_policy(policy)?;
+            apply_easytier_iface_override(&mut policy, easytier_iface);
             let commands = apply_commands_for_policy(&policy, web_base_url.clone(), platform)?;
             let report_target = report_target_from_flags(
                 web_base_url,
@@ -370,13 +382,15 @@ fn main() -> anyhow::Result<()> {
             policy,
             machine_id,
             easytier_ipv4,
+            easytier_iface,
             web_base_url,
             user_id,
             internal_auth_token,
             execute,
             platform,
         } => {
-            let policy = read_policy(policy)?;
+            let mut policy = read_policy(policy)?;
+            apply_easytier_iface_override(&mut policy, easytier_iface);
             let commands = cleanup_commands_for_policy(&policy, platform)?;
             let report_target = report_target_from_flags(
                 web_base_url,
@@ -397,6 +411,7 @@ fn main() -> anyhow::Result<()> {
             machine_id,
             internal_auth_token,
             easytier_ipv4,
+            easytier_iface,
             execute,
         } => {
             let target = ReportTarget {
@@ -405,7 +420,7 @@ fn main() -> anyhow::Result<()> {
                 machine_id: machine_id.clone(),
                 internal_auth_token,
             };
-            run_once(target, platform, easytier_ipv4, execute)?;
+            run_once(target, platform, easytier_ipv4, easytier_iface, execute)?;
         }
         Command::Run {
             platform,
@@ -414,6 +429,7 @@ fn main() -> anyhow::Result<()> {
             machine_id,
             internal_auth_token,
             easytier_ipv4,
+            easytier_iface,
             interval_seconds,
             execute,
         } => {
@@ -427,6 +443,7 @@ fn main() -> anyhow::Result<()> {
                 target,
                 platform,
                 easytier_ipv4,
+                easytier_iface,
                 execute,
                 Duration::from_secs(interval_seconds),
                 None,
@@ -441,6 +458,7 @@ fn run_loop(
     target: ReportTarget,
     platform: PlatformKind,
     easytier_ipv4: Option<String>,
+    easytier_iface: Option<String>,
     execute: bool,
     interval: Duration,
     max_iterations: Option<usize>,
@@ -452,6 +470,7 @@ fn run_loop(
             &target,
             platform,
             easytier_ipv4.clone(),
+            easytier_iface.clone(),
             execute,
             &mut reconciler,
         )?;
@@ -467,13 +486,18 @@ fn run_reconcile_iteration(
     target: &ReportTarget,
     platform: PlatformKind,
     easytier_ipv4: Option<String>,
+    easytier_iface: Option<String>,
     execute: bool,
     reconciler: &mut PolicyReconciler,
 ) -> anyhow::Result<()> {
     let policies = fetch_device_policies(target)?;
-    let policies_to_apply =
-        reconciler.policies_to_apply_at(&policies, Instant::now(), Some(DEFAULT_REAPPLY_INTERVAL))?;
-    for policy in policies_to_apply {
+    let policies_to_apply = reconciler.policies_to_apply_at(
+        &policies,
+        Instant::now(),
+        Some(DEFAULT_REAPPLY_INTERVAL),
+    )?;
+    for mut policy in policies_to_apply {
+        apply_easytier_iface_override(&mut policy, easytier_iface.clone());
         println!(
             "reconcile: {:?}",
             easytier_agent::ReconcileEvent::Apply(policy.device_policy_id.clone(), policy.version)
@@ -497,9 +521,13 @@ fn run_once(
     target: ReportTarget,
     platform: PlatformKind,
     easytier_ipv4: Option<String>,
+    easytier_iface: Option<String>,
     execute: bool,
 ) -> anyhow::Result<()> {
-    let policies = fetch_device_policies(&target)?;
+    let mut policies = fetch_device_policies(&target)?;
+    for policy in &mut policies {
+        apply_easytier_iface_override(policy, easytier_iface.clone());
+    }
     let mut reconciler = PolicyReconciler::default();
     for event in reconciler.reconcile(&policies)? {
         println!("reconcile: {event:?}");
@@ -523,6 +551,14 @@ fn run_once(
 fn read_policy(path: PathBuf) -> anyhow::Result<DevicePolicy> {
     let raw = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&raw)?)
+}
+
+fn apply_easytier_iface_override(policy: &mut DevicePolicy, easytier_iface: Option<String>) {
+    if let Some(easytier_iface) = easytier_iface {
+        if !easytier_iface.trim().is_empty() {
+            policy.easytier_iface = easytier_iface;
+        }
+    }
 }
 
 fn report_target_from_flags(
