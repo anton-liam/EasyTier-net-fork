@@ -2268,7 +2268,6 @@ dependencies = [
  "derivative",
  "derive_builder",
  "derive_more 2.1.1",
- "easytier-rpc-build",
  "encoding",
  "flume 0.12.0",
  "forwarded-header-value",
@@ -2314,6 +2313,7 @@ dependencies = [
  "pin-project-lite",
  "pnet",
  "prefix-trie",
+ "proc-macro2",
  "prost",
  "prost-build",
  "prost-reflect",
@@ -2323,6 +2323,7 @@ dependencies = [
  "prost-wkt-types",
  "quinn",
  "quinn-plaintext",
+ "quote",
  "rand 0.8.5",
  "rcgen",
  "regex",
@@ -2362,7 +2363,6 @@ dependencies = [
  "tokio-util",
  "tokio-websockets",
  "toml 0.8.19",
- "tonic-build",
  "tracing",
  "tracing-subscriber",
  "tun-easytier",
@@ -2452,14 +2452,6 @@ dependencies = [
  "uuid",
  "winapi",
  "windows 0.52.0",
-]
-
-[[package]]
-name = "easytier-rpc-build"
-version = "0.1.0"
-dependencies = [
- "heck 0.5.0",
- "prost-build",
 ]
 
 [[package]]
@@ -10070,19 +10062,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
-]
-
-[[package]]
-name = "tonic-build"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "568392c5a2bd0020723e3f387891176aabafe36fd9fcd074ad309dfa0c8eb964"
-dependencies = [
- "prettyplease",
- "proc-macro2",
- "prost-build",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
