@@ -7,7 +7,16 @@ pub struct ReportTarget {
     pub web_base_url: String,
     pub user_id: i32,
     pub machine_id: String,
-    pub internal_auth_token: String,
+    pub auth: AgentApiAuth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentApiAuth {
+    MachineToken {
+        token: String,
+        credential_version: i64,
+    },
+    LegacyInternalToken(String),
 }
 
 impl ReportTarget {
@@ -31,9 +40,8 @@ impl ReportTarget {
 }
 
 pub fn fetch_device_policies(target: &ReportTarget) -> anyhow::Result<Vec<DevicePolicy>> {
-    let response = attohttpc::get(target.device_policies_endpoint())
-        .header("X-Internal-Auth", &target.internal_auth_token)
-        .send()?;
+    let request = apply_auth_headers(attohttpc::get(target.device_policies_endpoint()), target);
+    let response = request.send()?;
 
     if !response.is_success() {
         anyhow::bail!(
@@ -46,10 +54,8 @@ pub fn fetch_device_policies(target: &ReportTarget) -> anyhow::Result<Vec<Device
 }
 
 pub fn post_runtime_report<T: Serialize>(target: &ReportTarget, report: &T) -> anyhow::Result<()> {
-    let response = attohttpc::post(target.endpoint())
-        .header("X-Internal-Auth", &target.internal_auth_token)
-        .json(report)?
-        .send()?;
+    let request = apply_auth_headers(attohttpc::post(target.endpoint()), target);
+    let response = request.json(report)?.send()?;
 
     if !response.is_success() {
         anyhow::bail!(
@@ -59,6 +65,21 @@ pub fn post_runtime_report<T: Serialize>(target: &ReportTarget, report: &T) -> a
     }
 
     Ok(())
+}
+
+pub fn apply_auth_headers(
+    request: attohttpc::RequestBuilder,
+    target: &ReportTarget,
+) -> attohttpc::RequestBuilder {
+    match &target.auth {
+        AgentApiAuth::MachineToken {
+            token,
+            credential_version,
+        } => request
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Credential-Version", credential_version.to_string()),
+        AgentApiAuth::LegacyInternalToken(token) => request.header("X-Internal-Auth", token),
+    }
 }
 
 #[cfg(test)]
@@ -71,7 +92,7 @@ mod tests {
             web_base_url: "http://127.0.0.1:11211/".to_string(),
             user_id: 7,
             machine_id: "00000000-0000-0000-0000-000000000001".to_string(),
-            internal_auth_token: "secret".to_string(),
+            auth: AgentApiAuth::LegacyInternalToken("secret".to_string()),
         };
 
         assert_eq!(
@@ -86,7 +107,7 @@ mod tests {
             web_base_url: "http://127.0.0.1:11211/".to_string(),
             user_id: 7,
             machine_id: "00000000-0000-0000-0000-000000000001".to_string(),
-            internal_auth_token: "secret".to_string(),
+            auth: AgentApiAuth::LegacyInternalToken("secret".to_string()),
         };
 
         assert_eq!(

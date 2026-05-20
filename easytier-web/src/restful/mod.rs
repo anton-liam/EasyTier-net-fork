@@ -1,3 +1,4 @@
+mod agent_credential;
 mod auth;
 pub(crate) mod captcha;
 mod gateway_policy;
@@ -8,6 +9,7 @@ mod users;
 
 use std::{net::SocketAddr, sync::Arc};
 
+use agent_credential::{AgentCredentialApi, machine_or_legacy_auth_middleware};
 use axum::extract::Path;
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self as axum_mw, Next};
@@ -244,6 +246,22 @@ impl RestfulServer {
             .quality(tower_http::compression::CompressionLevel::Default);
 
         // Token-authenticated management routes that bypass session auth.
+        let machine_routes_legacy_token = self.webhook_config.internal_auth_token.clone();
+        let machine_routes = Router::new()
+            .merge(GatewayPolicyApi::build_route_internal())
+            .with_state(self.client_mgr.clone())
+            .route_layer(axum_mw::from_fn({
+                let db = self.db.clone();
+                move |req, next| {
+                    machine_or_legacy_auth_middleware(
+                        db.clone(),
+                        machine_routes_legacy_token.clone(),
+                        req,
+                        next,
+                    )
+                }
+            }));
+
         let internal_app = if self.webhook_config.has_internal_auth() {
             let internal_token = self.webhook_config.internal_auth_token.clone().unwrap();
             let internal_routes = Router::new()
@@ -256,7 +274,6 @@ impl RestfulServer {
                     delete(Self::handle_disconnect_session_internal),
                 )
                 .merge(NetworkApi::build_route_internal())
-                .merge(GatewayPolicyApi::build_route_internal())
                 .merge(rpc::router_internal())
                 .with_state(self.client_mgr.clone())
                 .route_layer(axum_mw::from_fn(move |req, next| {
@@ -289,9 +306,13 @@ impl RestfulServer {
             .layer(tower_http::cors::CorsLayer::very_permissive())
             .layer(compression_layer);
 
+        app = app
+            .merge(AgentCredentialApi::build_route_internal().with_state(self.client_mgr.clone()));
+
         if let Some(internal_routes) = internal_app {
             app = app.merge(internal_routes);
         }
+        app = app.merge(machine_routes);
 
         #[cfg(feature = "embed")]
         let app = if let Some(web_router) = self.web_router.take() {

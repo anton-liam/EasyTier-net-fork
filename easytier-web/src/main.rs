@@ -24,6 +24,7 @@ use easytier::tunnel::IpScheme;
 use easytier::utils::BoxExt;
 use mimalloc::MiMalloc;
 
+mod agent_credential;
 mod client_manager;
 mod db;
 mod gateway_policy;

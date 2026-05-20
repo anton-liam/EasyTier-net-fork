@@ -7,11 +7,12 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use easytier_agent::{
-    AgentRuntimeReport, CommandExecutionMode, CommandPlan, ControlPlaneEndpoint, ControlPlaneGuard,
-    DevicePolicy, PlatformBackend, PolicyReconciler, ReportTarget, SystemCommandExecutor,
-    apply_command_plan, build_runtime_report, build_runtime_report_from_failure,
-    derive_policy_status_for_policy, dry_run_plan, fetch_device_policies,
-    platform::linux::LinuxBackend, platform::openwrt::OpenWrtBackend, post_runtime_report,
+    AgentApiAuth, AgentRuntimeReport, CommandExecutionMode, CommandPlan, ControlPlaneEndpoint,
+    ControlPlaneGuard, DevicePolicy, PlatformBackend, PolicyReconciler, ReportTarget,
+    SystemCommandExecutor, apply_command_plan, build_runtime_report,
+    build_runtime_report_from_failure, derive_policy_status_for_policy, dry_run_plan,
+    enroll_and_store_agent, fetch_device_policies, platform::linux::LinuxBackend,
+    platform::openwrt::OpenWrtBackend, post_runtime_report, rotate_and_confirm_credential,
 };
 
 const DEFAULT_REAPPLY_INTERVAL: Duration = Duration::from_secs(60);
@@ -47,6 +48,8 @@ enum Command {
         #[arg(long)]
         internal_auth_token: Option<String>,
         #[arg(long)]
+        credential_file: Option<PathBuf>,
+        #[arg(long)]
         execute: bool,
     },
     Cleanup {
@@ -67,6 +70,8 @@ enum Command {
         #[arg(long)]
         internal_auth_token: Option<String>,
         #[arg(long)]
+        credential_file: Option<PathBuf>,
+        #[arg(long)]
         execute: bool,
     },
     RunOnce {
@@ -79,7 +84,11 @@ enum Command {
         #[arg(long)]
         machine_id: String,
         #[arg(long)]
-        internal_auth_token: String,
+        internal_auth_token: Option<String>,
+        #[arg(long)]
+        credential_file: Option<PathBuf>,
+        #[arg(long)]
+        bootstrap_token: Option<String>,
         #[arg(long)]
         easytier_ipv4: Option<String>,
         #[arg(long)]
@@ -97,7 +106,11 @@ enum Command {
         #[arg(long)]
         machine_id: String,
         #[arg(long)]
-        internal_auth_token: String,
+        internal_auth_token: Option<String>,
+        #[arg(long)]
+        credential_file: Option<PathBuf>,
+        #[arg(long)]
+        bootstrap_token: Option<String>,
         #[arg(long)]
         easytier_ipv4: Option<String>,
         #[arg(long)]
@@ -163,6 +176,7 @@ mod tests {
             Some("http://127.0.0.1:11211".to_string()),
             None,
             Some("secret".to_string()),
+            None,
             "00000000-0000-0000-0000-000000000001".to_string(),
         )
         .unwrap_err();
@@ -306,7 +320,7 @@ mod tests {
             machine_id,
             "00000000-0000-0000-0000-000000000001".to_string()
         );
-        assert_eq!(internal_auth_token, "secret");
+        assert_eq!(internal_auth_token.as_deref(), Some("secret"));
     }
 
     #[test]
@@ -344,6 +358,38 @@ mod tests {
     }
 
     #[test]
+    fn report_target_prefers_credential_api_base_url() {
+        let dir =
+            std::env::temp_dir().join(format!("easytier-agent-main-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("credential.json");
+        easytier_agent::write_credential_atomic(
+            &path,
+            &easytier_agent::MachineCredentialFile {
+                machine_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                credential_version: 1,
+                current_token: "machine-token".to_string(),
+                next_token: None,
+                next_token_status: None,
+                api_base_url: Some("http://10.126.126.1:11212".to_string()),
+                updated_at: "2026-05-20T10:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+
+        let target = super::report_target_from_flags(
+            Some("http://137.220.194.19:11212".to_string()),
+            Some(2),
+            None,
+            Some(path),
+            "00000000-0000-0000-0000-000000000001".to_string(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(target.web_base_url, "http://10.126.126.1:11212");
+    }
+
+    #[test]
     fn run_loop_continues_after_iteration_error() {
         let mut attempts = 0usize;
         let mut slept = 0usize;
@@ -367,6 +413,31 @@ mod tests {
         assert_eq!(attempts, 3);
         assert_eq!(slept, 2);
     }
+
+    #[test]
+    fn managed_loop_keeps_retrying_when_control_plane_identity_is_not_ready() {
+        let mut attempts = 0usize;
+        let mut slept = 0usize;
+
+        super::run_loop_with_iteration(
+            Duration::from_secs(1),
+            Some(2),
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    anyhow::bail!("machine_not_connected");
+                }
+                Ok(())
+            },
+            |_| {
+                slept += 1;
+            },
+        )
+        .unwrap();
+
+        assert_eq!(attempts, 2);
+        assert_eq!(slept, 1);
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -387,6 +458,7 @@ fn main() -> anyhow::Result<()> {
             web_base_url,
             user_id,
             internal_auth_token,
+            credential_file,
             execute,
             platform,
         } => {
@@ -397,6 +469,7 @@ fn main() -> anyhow::Result<()> {
                 web_base_url,
                 user_id,
                 internal_auth_token,
+                credential_file,
                 machine_id.clone(),
             )?;
             let report = run_command_plan(machine_id, easytier_ipv4, &policy, commands, execute);
@@ -413,6 +486,7 @@ fn main() -> anyhow::Result<()> {
             web_base_url,
             user_id,
             internal_auth_token,
+            credential_file,
             execute,
             platform,
         } => {
@@ -423,6 +497,7 @@ fn main() -> anyhow::Result<()> {
                 web_base_url,
                 user_id,
                 internal_auth_token,
+                credential_file,
                 machine_id.clone(),
             )?;
             let report = run_command_plan(machine_id, easytier_ipv4, &policy, commands, execute);
@@ -437,16 +512,26 @@ fn main() -> anyhow::Result<()> {
             user_id,
             machine_id,
             internal_auth_token,
+            credential_file,
+            bootstrap_token,
             easytier_ipv4,
             easytier_iface,
             execute,
         } => {
-            let target = ReportTarget {
-                web_base_url: web_base_url.clone(),
-                user_id,
-                machine_id: machine_id.clone(),
+            let target = report_target_from_flags(
+                Some(web_base_url.clone()),
+                Some(user_id),
                 internal_auth_token,
-            };
+                ensure_credential_file(
+                    &web_base_url,
+                    bootstrap_token,
+                    credential_file,
+                    user_id,
+                    &machine_id,
+                )?,
+                machine_id.clone(),
+            )?
+            .ok_or_else(|| anyhow::anyhow!("web report target is required"))?;
             run_once(target, platform, easytier_ipv4, easytier_iface, execute)?;
         }
         Command::Run {
@@ -455,19 +540,20 @@ fn main() -> anyhow::Result<()> {
             user_id,
             machine_id,
             internal_auth_token,
+            credential_file,
+            bootstrap_token,
             easytier_ipv4,
             easytier_iface,
             interval_seconds,
             execute,
         } => {
-            let target = ReportTarget {
-                web_base_url: web_base_url.clone(),
+            run_managed_loop(
+                web_base_url,
                 user_id,
-                machine_id: machine_id.clone(),
+                machine_id,
                 internal_auth_token,
-            };
-            run_loop(
-                target,
+                credential_file,
+                bootstrap_token,
                 platform,
                 easytier_ipv4,
                 easytier_iface,
@@ -481,8 +567,14 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_loop(
-    target: ReportTarget,
+#[allow(clippy::too_many_arguments)]
+fn run_managed_loop(
+    web_base_url: String,
+    user_id: i32,
+    machine_id: String,
+    internal_auth_token: Option<String>,
+    credential_file: Option<PathBuf>,
+    bootstrap_token: Option<String>,
     platform: PlatformKind,
     easytier_ipv4: Option<String>,
     easytier_iface: Option<String>,
@@ -495,6 +587,14 @@ fn run_loop(
         interval,
         max_iterations,
         || {
+            let target = managed_report_target(
+                &web_base_url,
+                user_id,
+                &machine_id,
+                internal_auth_token.clone(),
+                credential_file.clone(),
+                bootstrap_token.clone(),
+            )?;
             run_reconcile_iteration(
                 &target,
                 platform,
@@ -506,6 +606,30 @@ fn run_loop(
         },
         thread::sleep,
     )
+}
+
+fn managed_report_target(
+    web_base_url: &str,
+    user_id: i32,
+    machine_id: &str,
+    internal_auth_token: Option<String>,
+    credential_file: Option<PathBuf>,
+    bootstrap_token: Option<String>,
+) -> anyhow::Result<ReportTarget> {
+    report_target_from_flags(
+        Some(web_base_url.to_string()),
+        Some(user_id),
+        internal_auth_token,
+        ensure_credential_file(
+            web_base_url,
+            bootstrap_token,
+            credential_file,
+            user_id,
+            machine_id,
+        )?,
+        machine_id.to_string(),
+    )?
+    .ok_or_else(|| anyhow::anyhow!("web report target is required"))
 }
 
 fn run_loop_with_iteration<I, S>(
@@ -610,24 +734,99 @@ fn apply_easytier_iface_override(policy: &mut DevicePolicy, easytier_iface: Opti
     }
 }
 
+fn ensure_credential_file(
+    web_base_url: &str,
+    bootstrap_token: Option<String>,
+    credential_file: Option<PathBuf>,
+    user_id: i32,
+    machine_id: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(credential_file) = credential_file else {
+        return Ok(None);
+    };
+    if credential_file.exists() {
+        let runtime_base_url = credential_runtime_base_url(&credential_file, web_base_url)?;
+        rotate_and_confirm_credential(&runtime_base_url, user_id, &credential_file)?;
+        return Ok(Some(credential_file));
+    }
+    let Some(bootstrap_token) = bootstrap_token else {
+        return Ok(Some(credential_file));
+    };
+
+    enroll_and_store_agent(
+        web_base_url,
+        &bootstrap_token,
+        user_id,
+        machine_id,
+        &credential_file,
+    )?;
+    let runtime_base_url = credential_runtime_base_url(&credential_file, web_base_url)?;
+    rotate_and_confirm_credential(&runtime_base_url, user_id, &credential_file)?;
+    Ok(Some(credential_file))
+}
+
+fn credential_runtime_base_url(
+    credential_file: &PathBuf,
+    fallback_web_base_url: &str,
+) -> anyhow::Result<String> {
+    let credential = easytier_agent::read_credential(credential_file)?;
+    Ok(credential
+        .api_base_url
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| fallback_web_base_url.to_string()))
+}
+
 fn report_target_from_flags(
     web_base_url: Option<String>,
     user_id: Option<i32>,
     internal_auth_token: Option<String>,
+    credential_file: Option<PathBuf>,
     machine_id: String,
 ) -> anyhow::Result<Option<ReportTarget>> {
-    match (web_base_url, user_id, internal_auth_token) {
-        (None, None, None) => Ok(None),
-        (Some(web_base_url), Some(user_id), Some(internal_auth_token)) => Ok(Some(ReportTarget {
-            web_base_url,
-            user_id,
-            machine_id,
-            internal_auth_token,
-        })),
-        _ => anyhow::bail!(
-            "all web report flags are required together: --web-base-url, --user-id, --internal-auth-token"
-        ),
+    let has_any = web_base_url.is_some()
+        || user_id.is_some()
+        || internal_auth_token.is_some()
+        || credential_file.is_some();
+    if !has_any {
+        return Ok(None);
     }
+
+    let (Some(web_base_url), Some(user_id)) = (web_base_url, user_id) else {
+        anyhow::bail!(
+            "all web report flags are required together: --web-base-url, --user-id, and either --credential-file or --internal-auth-token"
+        );
+    };
+
+    let mut runtime_web_base_url = web_base_url;
+    let auth = match (credential_file, internal_auth_token) {
+        (Some(credential_file), _) => {
+            let credential = easytier_agent::read_credential(credential_file)?;
+            if credential.machine_id != machine_id {
+                anyhow::bail!("credential file machine_id does not match --machine-id");
+            }
+            runtime_web_base_url = credential
+                .api_base_url
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .unwrap_or(runtime_web_base_url);
+            AgentApiAuth::MachineToken {
+                token: credential.current_token,
+                credential_version: credential.credential_version,
+            }
+        }
+        (None, Some(internal_auth_token)) => AgentApiAuth::LegacyInternalToken(internal_auth_token),
+        (None, None) => anyhow::bail!(
+            "all web report flags are required together: --web-base-url, --user-id, and either --credential-file or --internal-auth-token"
+        ),
+    };
+
+    Ok(Some(ReportTarget {
+        web_base_url: runtime_web_base_url,
+        user_id,
+        machine_id,
+        auth,
+    }))
 }
 
 fn apply_commands_for_policy(

@@ -16,6 +16,9 @@ use sea_orm_migration::MigratorTrait as _;
 use sqlx::{Row, Sqlite, SqlitePool, migrate::MigrateDatabase as _, types::chrono};
 use uuid::Uuid;
 
+use crate::agent_credential::{
+    BootstrapToken, MachineCredential, RotationStatus, hash_token, verify_token,
+};
 use crate::gateway_policy::{GatewayFullTunnelPolicy, RuntimeReport, validate_policy_conflicts};
 use crate::migrator;
 use async_trait::async_trait;
@@ -304,6 +307,353 @@ impl Db {
             })
             .collect()
     }
+
+    pub async fn create_agent_bootstrap_token(
+        &self,
+        user_id: UserIdInDb,
+        name: &str,
+        token_hash: String,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<i64, DbErr> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            r#"
+            INSERT INTO agent_bootstrap_tokens (
+                user_id,
+                token_hash,
+                name,
+                expires_at,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(user_id)
+        .bind(token_hash)
+        .bind(name)
+        .bind(expires_at.map(|value| value.to_rfc3339()))
+        .bind(now)
+        .execute(&self.db)
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn find_valid_agent_bootstrap_token(
+        &self,
+        token: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<BootstrapToken>, DbErr> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, user_id, token_hash, name, expires_at, revoked_at
+            FROM agent_bootstrap_tokens
+            WHERE revoked_at IS NULL
+            "#,
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+
+        for row in rows {
+            let expires_at =
+                parse_optional_utc(row.try_get("expires_at").map_err(sqlx_to_db_err)?)?;
+            if expires_at.is_some_and(|expires_at| now > expires_at) {
+                continue;
+            }
+
+            let token_hash: String = row.get("token_hash");
+            if verify_token(token, &token_hash) {
+                let id = row.get("id");
+                sqlx::query(
+                    r#"
+                    UPDATE agent_bootstrap_tokens
+                    SET last_used_at = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(now.to_rfc3339())
+                .bind(id)
+                .execute(&self.db)
+                .await
+                .map_err(|e| DbErr::Custom(e.to_string()))?;
+
+                return Ok(Some(BootstrapToken {
+                    id,
+                    user_id: row.get("user_id"),
+                    token_hash,
+                    name: row.get("name"),
+                    expires_at,
+                    revoked_at: parse_optional_utc(
+                        row.try_get("revoked_at").map_err(sqlx_to_db_err)?,
+                    )?,
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub async fn revoke_agent_bootstrap_token(&self, token_id: i64) -> Result<(), DbErr> {
+        sqlx::query(
+            r#"
+            UPDATE agent_bootstrap_tokens
+            SET revoked_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(token_id)
+        .execute(&self.db)
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+
+        Ok(())
+    }
+
+    pub async fn create_active_agent_machine_credential(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: Uuid,
+        machine_token: &str,
+    ) -> Result<MachineCredential, DbErr> {
+        let credential =
+            MachineCredential::active(user_id, machine_id, 1, hash_token(machine_token));
+        self.upsert_agent_machine_credential(&credential).await?;
+        Ok(credential)
+    }
+
+    pub async fn create_active_agent_machine_credential_from_hash(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: Uuid,
+        machine_token_hash: String,
+    ) -> Result<MachineCredential, DbErr> {
+        let credential = MachineCredential::active(user_id, machine_id, 1, machine_token_hash);
+        self.upsert_agent_machine_credential(&credential).await?;
+        Ok(credential)
+    }
+
+    pub async fn mark_agent_machine_credential_rotating(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: Uuid,
+        grace_until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), DbErr> {
+        let mut credential = self
+            .get_agent_machine_credential(user_id, machine_id)
+            .await?
+            .ok_or_else(|| DbErr::Custom("agent machine credential not found".to_string()))?;
+        credential.credential_version += 1;
+        credential.rotation_status = RotationStatus::Rotating;
+        credential.grace_until = Some(grace_until);
+        self.upsert_agent_machine_credential(&credential).await
+    }
+
+    pub async fn set_agent_machine_next_token(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: Uuid,
+        next_token: &str,
+    ) -> Result<MachineCredential, DbErr> {
+        let mut credential = self
+            .get_agent_machine_credential(user_id, machine_id)
+            .await?
+            .ok_or_else(|| DbErr::Custom("agent machine credential not found".to_string()))?;
+        credential.next_token_hash = Some(hash_token(next_token));
+        credential.rotation_status = RotationStatus::Rotating;
+        self.upsert_agent_machine_credential(&credential).await?;
+        Ok(credential)
+    }
+
+    pub async fn set_agent_machine_next_token_hash(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: Uuid,
+        next_token_hash: String,
+    ) -> Result<MachineCredential, DbErr> {
+        let mut credential = self
+            .get_agent_machine_credential(user_id, machine_id)
+            .await?
+            .ok_or_else(|| DbErr::Custom("agent machine credential not found".to_string()))?;
+        credential.next_token_hash = Some(next_token_hash);
+        credential.rotation_status = RotationStatus::Rotating;
+        self.upsert_agent_machine_credential(&credential).await?;
+        Ok(credential)
+    }
+
+    pub async fn confirm_agent_machine_credential_rotation(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: Uuid,
+    ) -> Result<MachineCredential, DbErr> {
+        let mut credential = self
+            .get_agent_machine_credential(user_id, machine_id)
+            .await?
+            .ok_or_else(|| DbErr::Custom("agent machine credential not found".to_string()))?;
+        let next_token_hash = credential.next_token_hash.clone().ok_or_else(|| {
+            DbErr::Custom("agent machine credential has no next token".to_string())
+        })?;
+        let previous_token_hash = credential.current_token_hash.clone();
+        credential.current_token_hash = next_token_hash;
+        credential.previous_token_hash = Some(previous_token_hash);
+        credential.next_token_hash = None;
+        credential.rotation_status = RotationStatus::Confirmed;
+        self.upsert_agent_machine_credential(&credential).await?;
+        Ok(credential)
+    }
+
+    pub async fn upsert_agent_machine_credential(
+        &self,
+        credential: &MachineCredential,
+    ) -> Result<(), DbErr> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO agent_machine_credentials (
+                user_id,
+                machine_id,
+                credential_version,
+                current_token_hash,
+                next_token_hash,
+                previous_token_hash,
+                rotation_status,
+                grace_until,
+                revoked_at,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, machine_id) DO UPDATE SET
+                credential_version = excluded.credential_version,
+                current_token_hash = excluded.current_token_hash,
+                next_token_hash = excluded.next_token_hash,
+                previous_token_hash = excluded.previous_token_hash,
+                rotation_status = excluded.rotation_status,
+                grace_until = excluded.grace_until,
+                revoked_at = excluded.revoked_at,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(credential.user_id)
+        .bind(credential.machine_id.to_string())
+        .bind(credential.credential_version)
+        .bind(&credential.current_token_hash)
+        .bind(credential.next_token_hash.as_deref())
+        .bind(credential.previous_token_hash.as_deref())
+        .bind(credential.rotation_status.as_str())
+        .bind(credential.grace_until.map(|value| value.to_rfc3339()))
+        .bind(credential.revoked_at.map(|value| value.to_rfc3339()))
+        .bind(now.clone())
+        .bind(now)
+        .execute(&self.db)
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+
+        Ok(())
+    }
+
+    pub async fn get_agent_machine_credential(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: Uuid,
+    ) -> Result<Option<MachineCredential>, DbErr> {
+        let Some(row) = sqlx::query(
+            r#"
+            SELECT
+                user_id,
+                machine_id,
+                credential_version,
+                current_token_hash,
+                next_token_hash,
+                previous_token_hash,
+                rotation_status,
+                grace_until,
+                revoked_at
+            FROM agent_machine_credentials
+            WHERE user_id = ? AND machine_id = ?
+            "#,
+        )
+        .bind(user_id)
+        .bind(machine_id.to_string())
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+
+        let rotation_status: String = row.get("rotation_status");
+        let rotation_status = RotationStatus::from_str(&rotation_status)
+            .ok_or_else(|| DbErr::Custom(format!("invalid rotation status: {rotation_status}")))?;
+
+        Ok(Some(MachineCredential {
+            user_id: row.get("user_id"),
+            machine_id: Uuid::parse_str(row.get::<String, _>("machine_id").as_str())
+                .map_err(|e| DbErr::Custom(e.to_string()))?,
+            credential_version: row.get("credential_version"),
+            current_token_hash: row.get("current_token_hash"),
+            next_token_hash: row.get("next_token_hash"),
+            previous_token_hash: row.get("previous_token_hash"),
+            rotation_status,
+            grace_until: parse_optional_utc(row.try_get("grace_until").map_err(sqlx_to_db_err)?)?,
+            revoked_at: parse_optional_utc(row.try_get("revoked_at").map_err(sqlx_to_db_err)?)?,
+        }))
+    }
+
+    pub async fn append_agent_credential_audit_log(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: Uuid,
+        action: &str,
+        credential_version: Option<i64>,
+        result: &str,
+        error: Option<&str>,
+    ) -> Result<(), DbErr> {
+        sqlx::query(
+            r#"
+            INSERT INTO agent_credential_audit_logs (
+                user_id,
+                machine_id,
+                action,
+                credential_version,
+                result,
+                error,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(user_id)
+        .bind(machine_id.to_string())
+        .bind(action)
+        .bind(credential_version)
+        .bind(result)
+        .bind(error)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.db)
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
+fn parse_optional_utc(
+    value: Option<String>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, DbErr> {
+    value
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(&value)
+                .map(|value| value.with_timezone(&chrono::Utc))
+                .map_err(|e| DbErr::Custom(e.to_string()))
+        })
+        .transpose()
+}
+
+fn sqlx_to_db_err(error: sqlx::Error) -> DbErr {
+    DbErr::Custom(error.to_string())
 }
 
 #[async_trait]
@@ -756,5 +1106,94 @@ mod tests {
                 && report.role
                     == Some(crate::gateway_policy::DevicePolicyRole::ProvideExitForGateway)
         }));
+    }
+
+    #[tokio::test]
+    async fn agent_bootstrap_token_lookup_requires_valid_non_revoked_token() {
+        let db = Db::memory_db().await;
+        let user_id = db
+            .auto_create_user("agent-bootstrap-user")
+            .await
+            .unwrap()
+            .id;
+        let now = chrono::Utc::now();
+
+        let token_id = db
+            .create_agent_bootstrap_token(
+                user_id,
+                "r3s-factory-image",
+                crate::agent_credential::hash_token("bootstrap-token"),
+                Some(now + chrono::Duration::hours(1)),
+            )
+            .await
+            .unwrap();
+
+        let matched = db
+            .find_valid_agent_bootstrap_token("bootstrap-token", now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(matched.id, token_id);
+        assert_eq!(matched.user_id, user_id);
+        assert!(
+            db.find_valid_agent_bootstrap_token("wrong-token", now)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        db.revoke_agent_bootstrap_token(token_id).await.unwrap();
+        assert!(
+            db.find_valid_agent_bootstrap_token("bootstrap-token", now)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_machine_credential_round_trip_keeps_hashes_only() {
+        let db = Db::memory_db().await;
+        let user_id = db
+            .auto_create_user("agent-credential-user")
+            .await
+            .unwrap()
+            .id;
+        let machine_id = uuid::Uuid::new_v4();
+        let credential = crate::agent_credential::MachineCredential::active(
+            user_id,
+            machine_id,
+            1,
+            crate::agent_credential::hash_token("machine-token"),
+        );
+
+        db.upsert_agent_machine_credential(&credential)
+            .await
+            .unwrap();
+
+        let stored = db
+            .get_agent_machine_credential(user_id, machine_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.user_id, user_id);
+        assert_eq!(stored.machine_id, machine_id);
+        assert_eq!(stored.credential_version, 1);
+        assert_eq!(
+            stored.verify_machine_token("machine-token", chrono::Utc::now()),
+            crate::agent_credential::TokenMatch::Current
+        );
+        assert_ne!(stored.current_token_hash, "machine-token");
+
+        db.append_agent_credential_audit_log(
+            user_id,
+            machine_id,
+            "enroll",
+            Some(1),
+            "success",
+            None,
+        )
+        .await
+        .unwrap();
     }
 }

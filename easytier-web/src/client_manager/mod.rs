@@ -204,6 +204,18 @@ impl ClientManager {
         self.storage.list_user_clients(user_id)
     }
 
+    pub fn has_machine(&self, user_id: UserIdInDb, machine_id: &uuid::Uuid) -> bool {
+        self.storage.has_machine(user_id, machine_id)
+    }
+
+    pub fn agent_api_base_url(&self) -> Option<String> {
+        self.webhook_config
+            .web_instance_api_base_url
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+    }
+
     pub async fn get_heartbeat_requests(&self, client_url: &url::Url) -> Option<HeartbeatRequest> {
         let s = self.client_sessions.get(client_url)?.clone();
         s.data().read().await.req()
@@ -214,8 +226,13 @@ impl ClientManager {
         s.data().read().await.location().cloned()
     }
 
-    fn db(&self) -> &Db {
+    pub(crate) fn db(&self) -> &Db {
         self.storage.db()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_for_tests(&self) -> Storage {
+        self.storage.clone()
     }
 
     pub async fn upsert_gateway_policy(

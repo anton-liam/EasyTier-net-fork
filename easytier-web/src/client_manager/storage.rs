@@ -114,6 +114,11 @@ impl Storage {
             .unwrap_or_default()
     }
 
+    pub fn has_machine(&self, user_id: UserIdInDb, machine_id: &uuid::Uuid) -> bool {
+        self.get_client_url_by_machine_id(user_id, machine_id)
+            .is_some()
+    }
+
     pub fn db(&self) -> &Db {
         &self.0.db
     }

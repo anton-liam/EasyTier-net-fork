@@ -6,6 +6,7 @@ mod m20260421_000003_add_network_config_source;
 mod m20260514_000004_gateway_policy;
 mod m20260516_000005_gateway_runtime_report_last_report_at;
 mod m20260518_000006_gateway_runtime_report_policy_role_key;
+mod m20260520_000007_agent_credentials;
 
 pub struct Migrator;
 
@@ -19,6 +20,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260514_000004_gateway_policy::Migration),
             Box::new(m20260516_000005_gateway_runtime_report_last_report_at::Migration),
             Box::new(m20260518_000006_gateway_runtime_report_policy_role_key::Migration),
+            Box::new(m20260520_000007_agent_credentials::Migration),
         ]
     }
 }
