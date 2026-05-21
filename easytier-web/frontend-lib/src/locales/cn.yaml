@@ -358,6 +358,8 @@ web:
     edit_policy: 编辑出口策略
     source_node: 入口节点
     exit_node: 出口节点
+    role_source: 本节点作为入口
+    role_exit: 本节点作为出口
     current_node: 当前节点
     normal_node: 普通节点
     control_plane: 控制面
@@ -376,8 +378,12 @@ web:
     status_applied: 已应用
     status_needs_check: 需检查
     no_policy_for_instance: 当前入口节点和 network instance 尚未创建出口策略
+    no_related_policy_for_node: 当前节点在该网络中尚未参与出口策略
+    loading_policy_state: 正在加载出口策略状态...
     device_traffic: 设备自身流量
     device_traffic_label: 设备流量
+    managed_scope: 受管流量
+    role_ipv4: EasyTier IPv4
     current_source_policy: 当前入口策略
     ingress_iface: 入口接口
     test_exit: 测试出口

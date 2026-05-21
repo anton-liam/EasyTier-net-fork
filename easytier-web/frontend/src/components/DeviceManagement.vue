@@ -1,12 +1,18 @@
 <script setup lang="ts">
 import { NetworkTypes, Utils, Api, RemoteManagement } from 'easytier-frontend-lib';
-import { Button, Message } from 'primevue';
-import { computed, ref } from 'vue';
+import { Button, Message, Tag } from 'primevue';
+import { computed, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useI18n } from 'vue-i18n';
 import ApiClient, { type GatewayPolicySnapshot } from '../modules/api';
 import GatewayPolicyEditor from './GatewayPolicyEditor.vue';
 import GatewayPolicyTopology from './GatewayPolicyTopology.vue';
+import {
+    buildGatewayPolicyRoleViews,
+    selectGatewayPolicyForParticipant,
+    selectGatewayPolicyForSource,
+    type GatewayPolicyRoleView,
+} from './gatewayPolicyViewModel';
 
 
 const props = defineProps<{
@@ -50,6 +56,8 @@ const topologyGatewayPolicy = ref<GatewayPolicySnapshot | null>(null);
 const gatewayPolicies = ref<GatewayPolicySnapshot[]>([]);
 const selectedGatewayNetworkId = ref('');
 const selectedGatewayNetworkInfo = ref<NetworkTypes.NetworkInstance | null>(null);
+const gatewayPolicyLoading = ref(false);
+const gatewayPolicyLoadError = ref('');
 
 const newConfigGenerator = () => {
     const config = NetworkTypes.DEFAULT_NETWORK_CONFIG();
@@ -105,33 +113,71 @@ const gatewayPolicyDisabledReason = (ctx: GatewayPolicyActionContext) => {
 
 const canOpenGatewayPolicy = (ctx: GatewayPolicyActionContext) => gatewayPolicyDisabledReason(ctx) === '';
 
-const selectGatewayPolicy = (policies: GatewayPolicySnapshot[], sourceMachineId: string, networkInstanceId: string) => (
-    policies
-        .filter((policy) => (
-            policy.desired.source_machine_id === sourceMachineId
-            && policy.desired.network_instance_id === networkInstanceId
-        ))
-        .sort((left, right) => {
-            if (left.desired.enabled !== right.desired.enabled) return left.desired.enabled ? -1 : 1;
-            return right.desired.desired_version - left.desired.desired_version;
-        })[0] || null
+const loadGatewayPolicies = async () => {
+    gatewayPolicyLoading.value = true;
+    gatewayPolicyLoadError.value = '';
+    try {
+        gatewayPolicies.value = await props.api.list_gateway_policies();
+    } catch (e) {
+        gatewayPolicyLoadError.value = String(e);
+    } finally {
+        gatewayPolicyLoading.value = false;
+    }
+};
+
+watch(() => [deviceId.value, instanceId.value, props.deviceList], () => {
+    if (!deviceId.value || !instanceId.value || !props.deviceList) return;
+    loadGatewayPolicies();
+}, { immediate: true });
+
+const currentGatewayRoleViews = computed(() => (
+    buildGatewayPolicyRoleViews(gatewayPolicies.value, gatewayDeviceOptions.value, deviceId.value, instanceId.value)
+));
+
+const statusSeverity = (status?: string | null) => {
+    if (status === 'active' || status === 'prepared') return 'success';
+    if (status === 'missing' || status === 'degraded' || status === 'rollbacked') return 'warn';
+    return 'secondary';
+};
+
+const policySeverity = (view: GatewayPolicyRoleView) => {
+    if (!view.policy.desired.enabled) return 'secondary';
+    if (view.role === 'source' && view.observedStatus === 'active') return 'success';
+    if (view.role === 'exit' && ['prepared', 'active'].includes(view.observedStatus)) return 'success';
+    return 'warn';
+};
+
+const roleLabel = (role: GatewayPolicyRoleView['role']) => (
+    role === 'source' ? t('web.gateway_policy.role_source') : t('web.gateway_policy.role_exit')
 );
+
+const roleFlowLabel = (view: GatewayPolicyRoleView) => (
+    view.role === 'source'
+        ? `${t('web.gateway_policy.current_node')} -> ${view.peer?.label || shortId(view.policy.desired.exit_machine_id)}`
+        : `${view.peer?.label || shortId(view.policy.desired.source_machine_id)} -> ${t('web.gateway_policy.current_node')}`
+);
+
+const managedScopeLabel = (policy: GatewayPolicySnapshot) => {
+    const cidrs = policy.desired.managed_cidrs.join(', ');
+    const deviceTraffic = policy.desired.include_device_traffic ? t('web.gateway_policy.device_traffic') : '';
+    return [cidrs, deviceTraffic].filter(Boolean).join(', ') || '-';
+};
 
 const openGatewayPolicyEditor = async (ctx: GatewayPolicyActionContext) => {
     if (!ctx.instanceId || !canOpenGatewayPolicy(ctx)) return;
     selectedGatewayNetworkId.value = ctx.instanceId;
     selectedGatewayNetworkInfo.value = ctx.networkInfo || null;
-    gatewayPolicies.value = await props.api.list_gateway_policies();
-    editingGatewayPolicy.value = selectGatewayPolicy(gatewayPolicies.value, deviceId.value, ctx.instanceId);
+    await loadGatewayPolicies();
+    editingGatewayPolicy.value = selectGatewayPolicyForSource(gatewayPolicies.value, deviceId.value, ctx.instanceId);
     gatewayPolicyEditorVisible.value = true;
 };
 
-const openGatewayTopology = async (ctx: GatewayPolicyActionContext) => {
+const openGatewayTopology = async (ctx: GatewayPolicyActionContext, policy?: GatewayPolicySnapshot | null) => {
     if (!ctx.instanceId || !canOpenGatewayPolicy(ctx)) return;
     selectedGatewayNetworkId.value = ctx.instanceId;
     selectedGatewayNetworkInfo.value = ctx.networkInfo || null;
-    gatewayPolicies.value = await props.api.list_gateway_policies();
-    topologyGatewayPolicy.value = selectGatewayPolicy(gatewayPolicies.value, deviceId.value, ctx.instanceId);
+    await loadGatewayPolicies();
+    topologyGatewayPolicy.value = policy || selectGatewayPolicyForParticipant(gatewayPolicies.value, deviceId.value, ctx.instanceId);
     gatewayPolicyTopologyVisible.value = true;
 };
 
@@ -158,9 +204,77 @@ const openGatewayTopology = async (ctx: GatewayPolicyActionContext) => {
                             @click="openGatewayPolicyEditor(slotProps)" />
                     </div>
                 </div>
+                <Message v-if="gatewayPolicyLoadError" severity="error" :closable="false" class="mt-3">
+                    {{ gatewayPolicyLoadError }}
+                </Message>
                 <Message v-if="!canOpenGatewayPolicy(slotProps)" severity="warn" :closable="false" class="mt-3">
                     {{ gatewayPolicyDisabledReason(slotProps) }}
                 </Message>
+                <div v-else class="mt-3 space-y-2">
+                    <div v-if="gatewayPolicyLoading" class="text-sm text-secondary">
+                        {{ t('web.gateway_policy.loading_policy_state') }}
+                    </div>
+                    <div v-else-if="currentGatewayRoleViews.length === 0" class="text-sm text-secondary">
+                        {{ t('web.gateway_policy.no_related_policy_for_node') }}
+                    </div>
+                    <div
+                        v-for="view in currentGatewayRoleViews"
+                        :key="`${view.policy.desired.policy_id}:${view.role}`"
+                        class="gateway-role-card"
+                    >
+                        <div class="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+                            <div>
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <Tag :severity="policySeverity(view)" :value="roleLabel(view.role)" />
+                                    <span class="font-medium">{{ roleFlowLabel(view) }}</span>
+                                </div>
+                                <div class="mt-2 grid gap-1 text-sm text-secondary md:grid-cols-2">
+                                    <div>
+                                        <span>{{ t('web.gateway_policy.managed_scope') }}</span>
+                                        <span class="ml-1 font-mono text-color">{{ managedScopeLabel(view.policy) }}</span>
+                                    </div>
+                                    <div>
+                                        <span>{{ t('web.gateway_policy.device_traffic_label') }}</span>
+                                        <span class="ml-1 text-color">{{ view.policy.desired.include_device_traffic ? t('web.common.enable') : t('web.common.disable') }}</span>
+                                    </div>
+                                    <div>
+                                        <span>{{ t('web.gateway_policy.desired') }}</span>
+                                        <span class="ml-1 text-color">{{ view.policy.desired.enabled ? t('web.gateway_policy.enabled') : t('web.gateway_policy.status_disabled') }} v{{ view.policy.desired.desired_version }}</span>
+                                    </div>
+                                    <div>
+                                        <span>{{ t('web.gateway_policy.observed') }}</span>
+                                        <Tag class="ml-1" :severity="statusSeverity(view.observedStatus)" :value="`${view.observedStatus} v${view.observedVersion ?? '-'}`" />
+                                    </div>
+                                    <div v-if="view.observedIpv4">
+                                        <span>{{ t('web.gateway_policy.role_ipv4') }}</span>
+                                        <span class="ml-1 font-mono text-color">{{ view.observedIpv4 }}</span>
+                                    </div>
+                                    <div v-if="view.policy.observed.source?.last_error || view.policy.observed.exit?.last_error">
+                                        <span>{{ t('web.gateway_policy.last_error') }}</span>
+                                        <span class="ml-1 text-color">{{ view.policy.observed.source?.last_error || view.policy.observed.exit?.last_error }}</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="flex shrink-0 flex-wrap gap-2">
+                                <Button
+                                    icon="pi pi-sitemap"
+                                    :label="t('web.gateway_policy.topology_button')"
+                                    severity="secondary"
+                                    size="small"
+                                    @click="openGatewayTopology(slotProps, view.policy)"
+                                />
+                                <Button
+                                    v-if="view.role === 'source'"
+                                    icon="pi pi-share-alt"
+                                    :label="t('web.gateway_policy.edit_policy')"
+                                    severity="secondary"
+                                    size="small"
+                                    @click="openGatewayPolicyEditor(slotProps)"
+                                />
+                            </div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </template>
     </RemoteManagement>
@@ -227,6 +341,13 @@ const openGatewayTopology = async (ctx: GatewayPolicyActionContext) => {
 
 :deep(.p-menu .p-menuitem-icon) {
     margin-right: 0.75rem;
+}
+
+.gateway-role-card {
+    border: 1px solid var(--surface-200, #e5e7eb);
+    border-radius: 0.375rem;
+    background: var(--surface-card, #ffffff);
+    padding: 0.75rem;
 }
 
 :deep(.p-menu .p-menuitem.p-error .p-menuitem-text,

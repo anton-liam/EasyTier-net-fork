@@ -358,6 +358,8 @@ web:
     edit_policy: Edit Gateway Policy
     source_node: Source Node
     exit_node: Exit Node
+    role_source: This Node as Source
+    role_exit: This Node as Exit
     current_node: Current Node
     normal_node: Node
     control_plane: Control Plane
@@ -376,8 +378,12 @@ web:
     status_applied: Applied
     status_needs_check: Needs Check
     no_policy_for_instance: No gateway policy exists for this source node and network instance
+    no_related_policy_for_node: No gateway policy is related to this node in the current network.
+    loading_policy_state: Loading gateway policy state...
     device_traffic: Device Traffic
     device_traffic_label: Device Traffic
+    managed_scope: Managed Traffic
+    role_ipv4: EasyTier IPv4
     current_source_policy: Current Source Policy
     ingress_iface: Ingress Interface
     test_exit: Test Exit
