@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::PathBuf,
+    process::Command as ProcessCommand,
     thread,
     time::{Duration, Instant},
 };
@@ -9,7 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use easytier_agent::{
     AgentApiAuth, AgentRuntimeReport, CommandExecutionMode, CommandPlan, ControlPlaneEndpoint,
     ControlPlaneGuard, DevicePolicy, PlatformBackend, PolicyReconciler, ReportTarget,
-    SystemCommandExecutor, apply_command_plan, build_runtime_report,
+    SystemCommandExecutor, apply_command_plan, build_idle_runtime_report, build_runtime_report,
     build_runtime_report_from_failure, derive_policy_status_for_policy, dry_run_plan,
     enroll_and_store_agent, fetch_device_policies, platform::linux::LinuxBackend,
     platform::openwrt::OpenWrtBackend, post_runtime_report, rotate_and_confirm_credential,
@@ -208,6 +209,7 @@ mod tests {
             r#"{{
               "policy_id": "p1",
               "device_policy_id": "p1/source",
+              "enabled": true,
               "version": 1,
               "role": "client_gateway_via_peer",
               "network_instance_id": "{}",
@@ -259,6 +261,7 @@ mod tests {
             r#"{{
               "policy_id": "p1",
               "device_policy_id": "p1/exit",
+              "enabled": true,
               "version": 1,
               "role": "provide_exit_for_gateway",
               "network_instance_id": "{}",
@@ -282,6 +285,42 @@ mod tests {
                 .any(|cmd| cmd.program == "fw4" && cmd.args == ["reload"])
         );
         assert!(!commands.iter().any(|cmd| cmd.program == "nft"));
+    }
+
+    #[test]
+    fn disabled_policy_uses_cleanup_plan() {
+        let policy: easytier_agent::DevicePolicy = serde_json::from_str(&format!(
+            r#"{{
+              "policy_id": "p1",
+              "device_policy_id": "p1/source",
+              "enabled": false,
+              "version": 1,
+              "role": "client_gateway_via_peer",
+              "network_instance_id": "{}",
+              "source_machine_id": "node-a",
+              "managed_cidrs": ["192.168.10.0/24"],
+              "ingress_ifaces": ["br-lan"],
+              "include_device_traffic": true,
+              "exit_machine_id": "node-b",
+              "exit_peer_ipv4": "10.126.126.3",
+              "protect_control_plane": true,
+              "rollback_enabled": true
+            }}"#,
+            uuid::Uuid::nil()
+        ))
+        .unwrap();
+
+        let commands =
+            super::commands_for_reported_policy(&policy, None, PlatformKind::OpenWrt).unwrap();
+
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "sh"
+                && cmd
+                    .args
+                    .join(" ")
+                    .contains("ip rule del from 192.168.10.0/24 lookup 126 2>/dev/null || true")
+        }));
+        assert!(!commands.iter().any(|cmd| cmd.program == "fw4" && cmd.args == ["reload"]));
     }
 
     #[test]
@@ -437,6 +476,27 @@ mod tests {
 
         assert_eq!(attempts, 2);
         assert_eq!(slept, 1);
+    }
+
+    #[test]
+    fn parses_ipv4_from_ip_addr_output() {
+        let output = "7: easytierw0    inet 10.126.126.2/24 brd 10.126.126.255 scope global easytierw0\\       valid_lft forever preferred_lft forever\n";
+
+        assert_eq!(
+            super::parse_ipv4_from_ip_addr_output(output),
+            Some("10.126.126.2".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_easytier_ipv4_wins_over_interface_detection() {
+        assert_eq!(
+            super::resolve_easytier_ipv4(
+                Some("10.126.126.9".to_string()),
+                Some("easytierw0")
+            ),
+            Some("10.126.126.9".to_string())
+        );
     }
 }
 
@@ -664,6 +724,15 @@ fn run_reconcile_iteration(
     reconciler: &mut PolicyReconciler,
 ) -> anyhow::Result<()> {
     let policies = fetch_device_policies(target)?;
+    let observed_easytier_ipv4 =
+        resolve_easytier_ipv4(easytier_ipv4.clone(), easytier_iface.as_deref());
+    if policies.is_empty() {
+        let report =
+            build_idle_runtime_report(target.machine_id.clone(), observed_easytier_ipv4);
+        post_runtime_report(target, &report)?;
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(());
+    }
     let policies_to_apply = reconciler.policies_to_apply_at(
         &policies,
         Instant::now(),
@@ -675,11 +744,14 @@ fn run_reconcile_iteration(
             "reconcile: {:?}",
             easytier_agent::ReconcileEvent::Apply(policy.device_policy_id.clone(), policy.version)
         );
-        let commands =
-            apply_commands_for_policy(&policy, Some(target.web_base_url.clone()), platform)?;
+        let commands = commands_for_reported_policy(
+            &policy,
+            Some(target.web_base_url.clone()),
+            platform,
+        )?;
         let report = run_command_plan(
             target.machine_id.clone(),
-            easytier_ipv4.clone(),
+            observed_easytier_ipv4.clone(),
             &policy,
             commands,
             execute,
@@ -698,6 +770,14 @@ fn run_once(
     execute: bool,
 ) -> anyhow::Result<()> {
     let mut policies = fetch_device_policies(&target)?;
+    let observed_easytier_ipv4 =
+        resolve_easytier_ipv4(easytier_ipv4.clone(), easytier_iface.as_deref());
+    if policies.is_empty() {
+        let report = build_idle_runtime_report(target.machine_id.clone(), observed_easytier_ipv4);
+        post_runtime_report(&target, &report)?;
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(());
+    }
     for policy in &mut policies {
         apply_easytier_iface_override(policy, easytier_iface.clone());
     }
@@ -706,11 +786,14 @@ fn run_once(
         println!("reconcile: {event:?}");
     }
     for policy in policies {
-        let commands =
-            apply_commands_for_policy(&policy, Some(target.web_base_url.clone()), platform)?;
+        let commands = commands_for_reported_policy(
+            &policy,
+            Some(target.web_base_url.clone()),
+            platform,
+        )?;
         let report = run_command_plan(
             target.machine_id.clone(),
-            easytier_ipv4.clone(),
+            observed_easytier_ipv4.clone(),
             &policy,
             commands,
             execute,
@@ -724,6 +807,46 @@ fn run_once(
 fn read_policy(path: PathBuf) -> anyhow::Result<DevicePolicy> {
     let raw = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&raw)?)
+}
+
+fn resolve_easytier_ipv4(
+    explicit_ipv4: Option<String>,
+    easytier_iface: Option<&str>,
+) -> Option<String> {
+    explicit_ipv4
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            easytier_iface
+                .filter(|iface| !iface.trim().is_empty())
+                .and_then(detect_iface_ipv4)
+        })
+}
+
+fn detect_iface_ipv4(iface: &str) -> Option<String> {
+    let output = ProcessCommand::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", iface])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_ipv4_from_ip_addr_output(std::str::from_utf8(&output.stdout).ok()?)
+}
+
+fn parse_ipv4_from_ip_addr_output(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        while let Some(part) = parts.next() {
+            if part == "inet" {
+                return parts
+                    .next()
+                    .and_then(|cidr| cidr.split('/').next())
+                    .filter(|ip| !ip.trim().is_empty())
+                    .map(str::to_string);
+            }
+        }
+        None
+    })
 }
 
 fn apply_easytier_iface_override(policy: &mut DevicePolicy, easytier_iface: Option<String>) {
@@ -839,6 +962,18 @@ fn apply_commands_for_policy(
     Ok(commands)
 }
 
+fn commands_for_reported_policy(
+    policy: &DevicePolicy,
+    web_base_url: Option<String>,
+    platform: PlatformKind,
+) -> anyhow::Result<Vec<CommandPlan>> {
+    if policy.enabled {
+        apply_commands_for_policy(policy, web_base_url, platform)
+    } else {
+        cleanup_commands_for_policy(policy, platform)
+    }
+}
+
 fn control_plane_commands(
     policy: &DevicePolicy,
     web_base_url: Option<String>,
@@ -927,19 +1062,21 @@ fn run_command_plan(
                 println!("executed_count: {}", command_report.executed_count);
             }
             let status = derive_policy_status_for_policy(policy, &command_report, None, false);
-            let mut report =
-                build_runtime_report(machine_id, policy, status, &command_report, None);
-            report.easytier_ipv4 = easytier_ipv4;
-            report
+            build_runtime_report(
+                machine_id,
+                easytier_ipv4,
+                policy,
+                status,
+                &command_report,
+                None,
+            )
         }
         Err(failure) => {
             for command in &failure.report.commands {
                 println!("{} {}", command.program, command.args.join(" "));
             }
             println!("executed_count: {}", failure.report.executed_count);
-            let mut report = build_runtime_report_from_failure(machine_id, policy, &failure);
-            report.easytier_ipv4 = easytier_ipv4;
-            report
+            build_runtime_report_from_failure(machine_id, easytier_ipv4, policy, &failure)
         }
     }
 }

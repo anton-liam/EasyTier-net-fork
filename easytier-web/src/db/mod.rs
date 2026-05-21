@@ -201,7 +201,7 @@ impl Db {
     ) -> Result<Vec<GatewayFullTunnelPolicy>, DbErr> {
         let rows = sqlx::query(
             r#"
-            SELECT policy_json
+            SELECT policy_json, enabled
             FROM gateway_full_tunnel_policies
             WHERE user_id = ?
             ORDER BY policy_id
@@ -215,7 +215,10 @@ impl Db {
         rows.into_iter()
             .map(|row| {
                 let policy_json: String = row.get("policy_json");
-                serde_json::from_str(&policy_json).map_err(|e| DbErr::Json(e.to_string()))
+                let mut policy: GatewayFullTunnelPolicy =
+                    serde_json::from_str(&policy_json).map_err(|e| DbErr::Json(e.to_string()))?;
+                policy.enabled = row.get("enabled");
+                Ok(policy)
             })
             .collect()
     }
@@ -223,8 +226,13 @@ impl Db {
     pub async fn upsert_gateway_runtime_report(
         &self,
         user_id: UserIdInDb,
-        report: RuntimeReport,
+        mut report: RuntimeReport,
     ) -> Result<(), DbErr> {
+        if report.easytier_ipv4.is_none() {
+            report.easytier_ipv4 = self
+                .latest_gateway_runtime_report_ipv4(user_id, report.machine_id)
+                .await?;
+        }
         let report_json = serde_json::to_string(&report).map_err(|e| DbErr::Json(e.to_string()))?;
         let now = chrono::Local::now().fixed_offset().to_rfc3339();
 
@@ -275,6 +283,29 @@ impl Db {
         .map_err(|e| DbErr::Custom(e.to_string()))?;
 
         Ok(())
+    }
+
+    async fn latest_gateway_runtime_report_ipv4(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: Uuid,
+    ) -> Result<Option<String>, DbErr> {
+        let row = sqlx::query(
+            r#"
+            SELECT easytier_ipv4
+            FROM gateway_runtime_reports
+            WHERE user_id = ? AND machine_id = ? AND easytier_ipv4 IS NOT NULL AND easytier_ipv4 != ''
+            ORDER BY update_time DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id)
+        .bind(machine_id.to_string())
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+
+        Ok(row.and_then(|row| row.get::<Option<String>, _>("easytier_ipv4")))
     }
 
     pub async fn list_gateway_runtime_reports(
@@ -1017,6 +1048,19 @@ mod tests {
         let policies = db.list_gateway_policies(user_id).await.unwrap();
         assert_eq!(policies, vec![policy.clone()]);
 
+        sqlx::query("UPDATE gateway_full_tunnel_policies SET enabled = 0 WHERE policy_id = ?")
+            .bind(policy.policy_id.to_string())
+            .execute(&db.inner())
+            .await
+            .unwrap();
+
+        let disabled_policies = db.list_gateway_policies(user_id).await.unwrap();
+        assert!(!disabled_policies[0].enabled);
+
+        db.upsert_gateway_policy(user_id, policy.clone())
+            .await
+            .unwrap();
+
         let duplicate_source = base_gateway_policy(source, uuid::Uuid::new_v4());
         assert!(
             db.upsert_gateway_policy(user_id, duplicate_source)
@@ -1105,6 +1149,63 @@ mod tests {
             report.observed_policy_id == Some(policy_b)
                 && report.role
                     == Some(crate::gateway_policy::DevicePolicyRole::ProvideExitForGateway)
+        }));
+    }
+
+    #[tokio::test]
+    async fn gateway_policy_report_without_ipv4_keeps_latest_machine_ipv4() {
+        let db = Db::memory_db().await;
+        let user_id = db.auto_create_user("gateway-report-ip-user").await.unwrap().id;
+        let node = uuid::Uuid::new_v4();
+        let policy_id = uuid::Uuid::new_v4();
+
+        db.upsert_gateway_runtime_report(
+            user_id,
+            RuntimeReport {
+                machine_id: node,
+                agent_version: "0.1.0".to_string(),
+                easytier_ipv4: Some("10.126.126.3".to_string()),
+                last_report_at: Some("2026-05-16T10:00:00+00:00".to_string()),
+                policy_id: None,
+                device_policy_id: None,
+                version: None,
+                role: None,
+                status: Some("prepared".to_string()),
+                observed_policy_id: None,
+                observed_policy_version: None,
+                observed_policy_status: Some("prepared".to_string()),
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        db.upsert_gateway_runtime_report(
+            user_id,
+            RuntimeReport {
+                machine_id: node,
+                agent_version: "0.1.0".to_string(),
+                easytier_ipv4: None,
+                last_report_at: Some("2026-05-16T10:01:00+00:00".to_string()),
+                policy_id: Some(policy_id),
+                device_policy_id: Some(format!("{policy_id}/exit")),
+                version: Some(1),
+                role: Some(crate::gateway_policy::DevicePolicyRole::ProvideExitForGateway),
+                status: Some("prepared".to_string()),
+                observed_policy_id: Some(policy_id),
+                observed_policy_version: Some(1),
+                observed_policy_status: Some("prepared".to_string()),
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let reports = db.list_gateway_runtime_reports(user_id).await.unwrap();
+
+        assert!(reports.iter().any(|report| {
+            report.policy_id == Some(policy_id)
+                && report.easytier_ipv4.as_deref() == Some("10.126.126.3")
         }));
     }
 

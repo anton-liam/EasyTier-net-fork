@@ -26,6 +26,7 @@ pub struct AgentRuntimeReport {
 
 pub fn build_runtime_report(
     machine_id: impl Into<String>,
+    easytier_ipv4: Option<String>,
     policy: &DevicePolicy,
     status: PolicyStatus,
     command_report: &CommandExecutionReport,
@@ -34,7 +35,7 @@ pub fn build_runtime_report(
     AgentRuntimeReport {
         machine_id: machine_id.into(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
-        easytier_ipv4: None,
+        easytier_ipv4,
         policy_id: policy.policy_id.clone(),
         device_policy_id: policy.device_policy_id.clone(),
         version: policy.version,
@@ -51,16 +52,40 @@ pub fn build_runtime_report(
 
 pub fn build_runtime_report_from_failure(
     machine_id: impl Into<String>,
+    easytier_ipv4: Option<String>,
     policy: &DevicePolicy,
     failure: &CommandExecutionFailure,
 ) -> AgentRuntimeReport {
     build_runtime_report(
         machine_id,
+        easytier_ipv4,
         policy,
         derive_policy_status(&failure.report, Some(&failure.error), false),
         &failure.report,
         Some(failure.error.clone()),
     )
+}
+
+pub fn build_idle_runtime_report(
+    machine_id: impl Into<String>,
+    easytier_ipv4: Option<String>,
+) -> AgentRuntimeReport {
+    AgentRuntimeReport {
+        machine_id: machine_id.into(),
+        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        easytier_ipv4,
+        policy_id: String::new(),
+        device_policy_id: String::new(),
+        version: 0,
+        role: String::new(),
+        status: PolicyStatus::Prepared,
+        observed_policy_id: String::new(),
+        observed_policy_version: 0,
+        observed_policy_status: PolicyStatus::Prepared,
+        dry_run: false,
+        executed_count: 0,
+        last_error: None,
+    }
 }
 
 pub fn derive_policy_status(
@@ -89,6 +114,9 @@ pub fn derive_policy_status_for_policy(
     last_error: Option<&str>,
     rollbacked: bool,
 ) -> PolicyStatus {
+    if !policy.enabled && last_error.is_none() {
+        return PolicyStatus::Disabled;
+    }
     let status = derive_policy_status(command_report, last_error, rollbacked);
     if status == PolicyStatus::Active && policy.role == DevicePolicyRole::ProvideExitForGateway {
         return PolicyStatus::Prepared;
@@ -117,6 +145,7 @@ mod tests {
         DevicePolicy {
             policy_id: "p1".to_string(),
             device_policy_id: "p1/source".to_string(),
+            enabled: true,
             version: 2,
             role: DevicePolicyRole::ClientGatewayViaPeer,
             network_instance_id: Uuid::nil(),
@@ -144,6 +173,7 @@ mod tests {
 
         let report = build_runtime_report(
             "node-a",
+            Some("10.126.126.2".to_string()),
             &policy,
             PolicyStatus::Active,
             &command_report,
@@ -155,6 +185,7 @@ mod tests {
         assert_eq!(report.device_policy_id, "p1/source");
         assert_eq!(report.version, 2);
         assert_eq!(report.role, "client_gateway_via_peer");
+        assert_eq!(report.easytier_ipv4.as_deref(), Some("10.126.126.2"));
         assert!(report.dry_run);
         assert_eq!(report.executed_count, 0);
         assert_eq!(report.status, PolicyStatus::Active);
@@ -170,6 +201,7 @@ mod tests {
 
         let report = build_runtime_report(
             "00000000-0000-0000-0000-000000000001",
+            Some("10.126.126.2".to_string()),
             &policy,
             PolicyStatus::Active,
             &command_report,
@@ -180,6 +212,21 @@ mod tests {
         assert_eq!(json["observed_policy_id"], "p1");
         assert_eq!(json["observed_policy_version"], 2);
         assert_eq!(json["observed_policy_status"], "active");
+        assert_eq!(json["easytier_ipv4"], "10.126.126.2");
+    }
+
+    #[test]
+    fn builds_idle_runtime_report_for_node_discovery_without_policy() {
+        let report = build_idle_runtime_report("node-a", Some("10.126.126.2".to_string()));
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(report.machine_id, "node-a");
+        assert_eq!(report.easytier_ipv4.as_deref(), Some("10.126.126.2"));
+        assert_eq!(report.policy_id, "");
+        assert_eq!(report.device_policy_id, "");
+        assert_eq!(report.role, "");
+        assert_eq!(report.status, PolicyStatus::Prepared);
+        assert_eq!(json["easytier_ipv4"], "10.126.126.2");
     }
 
     #[test]
@@ -226,6 +273,22 @@ mod tests {
     }
 
     #[test]
+    fn disabled_policy_reports_disabled_after_cleanup() {
+        let mut policy = policy();
+        policy.enabled = false;
+        let commands = vec![CommandPlan::new("ip", ["rule", "del", "from", "192.168.10.0/24"])];
+        let mut executor = NoopExecutor;
+        let command_report =
+            apply_command_plan(commands, CommandExecutionMode::Execute, &mut executor).unwrap();
+
+        assert_eq!(
+            derive_policy_status_for_policy(&policy, &command_report, None, false),
+            PolicyStatus::Disabled
+        );
+    }
+
+
+    #[test]
     fn derives_degraded_when_last_error_exists() {
         let commands = vec![CommandPlan::new("ip", ["route", "show", "default"])];
         let mut executor = NoopExecutor;
@@ -263,9 +326,15 @@ mod tests {
             error: "synthetic command failure".to_string(),
         };
 
-        let report = build_runtime_report_from_failure("node-a", &policy, &failure);
+        let report = build_runtime_report_from_failure(
+            "node-a",
+            Some("10.126.126.2".to_string()),
+            &policy,
+            &failure,
+        );
 
         assert_eq!(report.status, PolicyStatus::Degraded);
+        assert_eq!(report.easytier_ipv4.as_deref(), Some("10.126.126.2"));
         assert_eq!(report.executed_count, 1);
         assert_eq!(
             report.last_error.as_deref(),

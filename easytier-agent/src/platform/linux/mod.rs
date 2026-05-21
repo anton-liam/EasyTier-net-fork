@@ -136,32 +136,41 @@ impl LinuxBackend {
                 continue;
             }
             commands.push(CommandPlan::new(
-                "ip",
+                "sh",
                 [
-                    "rule",
-                    "del",
-                    "from",
-                    cidr,
-                    "lookup",
-                    &self.table_id.to_string(),
+                    "-c",
+                    &format!(
+                        "ip rule del from {cidr} lookup {table} 2>/dev/null || true",
+                        table = self.table_id
+                    ),
                 ],
             ));
         }
         if policy.include_device_traffic {
             commands.push(CommandPlan::new(
-                "ip",
+                "sh",
                 [
-                    "rule",
-                    "del",
-                    "fwmark",
-                    &self.mark,
-                    "lookup",
-                    &self.table_id.to_string(),
+                    "-c",
+                    &format!(
+                        "ip rule del fwmark {mark} lookup {table} 2>/dev/null || true",
+                        mark = self.mark,
+                        table = self.table_id
+                    ),
                 ],
             ));
             commands
                 .push(self.delete_nft_rules_by_comment_command("output", &policy.device_policy_id));
         }
+        commands.push(CommandPlan::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    "ip route flush table {table} 2>/dev/null || true",
+                    table = self.table_id
+                ),
+            ],
+        ));
         commands
     }
 
@@ -266,8 +275,26 @@ impl LinuxBackend {
                 .managed_cidrs
                 .iter()
                 .filter(|cidr| cidr.trim() != "0.0.0.0/0")
-                .map(|cidr| CommandPlan::new("ip", ["route", "del", cidr])),
+                .map(|cidr| {
+                    CommandPlan::new(
+                        "sh",
+                        [
+                            "-c",
+                            &format!("ip route del {cidr} 2>/dev/null || true"),
+                        ],
+                    )
+                }),
         )
+        .chain(std::iter::once(CommandPlan::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    "ip route flush table {table} 2>/dev/null || true",
+                    table = self.table_id
+                ),
+            ],
+        )))
         .collect()
     }
 }
@@ -301,6 +328,7 @@ mod tests {
         DevicePolicy {
             policy_id: "p1".to_string(),
             device_policy_id: "p1/source".to_string(),
+            enabled: true,
             version: 1,
             role,
             network_instance_id: Uuid::nil(),
@@ -360,11 +388,20 @@ mod tests {
         let commands = backend
             .plan_cleanup(&policy(DevicePolicyRole::ClientGatewayViaPeer))
             .unwrap();
-        assert!(
-            commands
-                .iter()
-                .any(|cmd| cmd.args.contains(&"del".to_string()))
-        );
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "sh"
+                && cmd
+                    .args
+                    .join(" ")
+                    .contains("ip rule del from 192.168.10.0/24 lookup 126 2>/dev/null || true")
+        }));
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "sh"
+                && cmd
+                    .args
+                    .join(" ")
+                    .contains("ip route flush table 126 2>/dev/null || true")
+        }));
         assert!(commands.iter().any(|cmd| {
             cmd.program == "sh"
                 && cmd
@@ -519,15 +556,16 @@ mod tests {
             commands
                 .iter()
                 .filter(|command| command.program == "sh")
+                .filter(|command| command.args.join(" ").contains("nft"))
                 .all(|command| command.args.contains(&"p1/source".to_string()))
         );
-        assert!(commands.iter().any(|command| command.program == "ip"
-            && command.args
-                == [
-                    "route".to_string(),
-                    "del".to_string(),
-                    "192.168.10.0/24".to_string(),
-                ]));
+        assert!(commands.iter().any(|command| {
+            command.program == "sh"
+                && command
+                    .args
+                    .join(" ")
+                    .contains("ip route del 192.168.10.0/24 2>/dev/null || true")
+        }));
         assert!(
             commands
                 .iter()

@@ -108,14 +108,13 @@ impl OpenWrtBackend {
             .filter(|cidr| !is_ipv4_default_route(cidr))
         {
             commands.push(CommandPlan::new(
-                "ip",
+                "sh",
                 [
-                    "rule",
-                    "del",
-                    "from",
-                    cidr,
-                    "lookup",
-                    &self.table_id.to_string(),
+                    "-c",
+                    &format!(
+                        "ip rule del from {cidr} lookup {table} 2>/dev/null || true",
+                        table = self.table_id
+                    ),
                 ],
             ));
         }
@@ -126,31 +125,40 @@ impl OpenWrtBackend {
         {
             for iface in &policy.ingress_ifaces {
                 commands.push(CommandPlan::new(
-                    "ip",
+                    "sh",
                     [
-                        "rule",
-                        "del",
-                        "iif",
-                        iface,
-                        "lookup",
-                        &self.table_id.to_string(),
+                        "-c",
+                        &format!(
+                            "ip rule del iif {iface} lookup {table} 2>/dev/null || true",
+                            table = self.table_id
+                        ),
                     ],
                 ));
             }
         }
         if policy.include_device_traffic {
             commands.push(CommandPlan::new(
-                "ip",
+                "sh",
                 [
-                    "rule",
-                    "del",
-                    "fwmark",
-                    &self.mark,
-                    "lookup",
-                    &self.table_id.to_string(),
+                    "-c",
+                    &format!(
+                        "ip rule del fwmark {mark} lookup {table} 2>/dev/null || true",
+                        mark = self.mark,
+                        table = self.table_id
+                    ),
                 ],
             ));
         }
+        commands.push(CommandPlan::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    "ip route flush table {table} 2>/dev/null || true",
+                    table = self.table_id
+                ),
+            ],
+        ));
         commands
     }
 
@@ -219,6 +227,16 @@ impl OpenWrtBackend {
                     )
                 }),
         )
+        .chain(std::iter::once(CommandPlan::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    "ip route flush table {table} 2>/dev/null || true",
+                    table = self.table_id
+                ),
+            ],
+        )))
         .collect()
     }
 
@@ -248,8 +266,26 @@ impl OpenWrtBackend {
                 .managed_cidrs
                 .iter()
                 .filter(|cidr| !is_ipv4_default_route(cidr))
-                .map(|cidr| CommandPlan::new("ip", ["route", "del", cidr])),
+                .map(|cidr| {
+                    CommandPlan::new(
+                        "sh",
+                        [
+                            "-c",
+                            &format!("ip route del {cidr} 2>/dev/null || true"),
+                        ],
+                    )
+                }),
         )
+        .chain(std::iter::once(CommandPlan::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    "ip route flush table {table} 2>/dev/null || true",
+                    table = self.table_id
+                ),
+            ],
+        )))
         .collect()
     }
 }
@@ -337,6 +373,7 @@ mod tests {
         DevicePolicy {
             policy_id: "p1".to_string(),
             device_policy_id: "p1/source".to_string(),
+            enabled: true,
             version: 1,
             role,
             network_instance_id: Uuid::nil(),
@@ -487,6 +524,38 @@ mod tests {
         assert!(command_text.contains("ip rule add iif br-lan lookup 126"));
         assert!(command_text.contains("ip rule del from 0.0.0.0/0 lookup 126"));
         assert!(!command_text.contains("ip rule add from 0.0.0.0/0 lookup 126"));
+    }
+
+    #[test]
+    fn source_cleanup_flushes_policy_route_table() {
+        let backend = OpenWrtBackend::default();
+        let commands = backend
+            .plan_cleanup(&policy(DevicePolicyRole::ClientGatewayViaPeer))
+            .unwrap();
+
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "sh"
+                && cmd
+                    .args
+                    .join(" ")
+                    .contains("ip route flush table 126 2>/dev/null || true")
+        }));
+    }
+
+    #[test]
+    fn exit_cleanup_flushes_policy_route_table() {
+        let backend = OpenWrtBackend::default();
+        let commands = backend
+            .plan_cleanup(&policy(DevicePolicyRole::ProvideExitForGateway))
+            .unwrap();
+
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "sh"
+                && cmd
+                    .args
+                    .join(" ")
+                    .contains("ip route flush table 126 2>/dev/null || true")
+        }));
     }
 
     #[test]

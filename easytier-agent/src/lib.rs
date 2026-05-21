@@ -28,7 +28,8 @@ pub use policy::{
 };
 pub use reconciler::{PolicyReconciler, ReconcileEvent};
 pub use report::{
-    AgentRuntimeReport, build_runtime_report, build_runtime_report_from_failure,
+    AgentRuntimeReport, build_idle_runtime_report, build_runtime_report,
+    build_runtime_report_from_failure,
     derive_policy_status, derive_policy_status_for_policy,
 };
 pub use reporter::{AgentApiAuth, ReportTarget, fetch_device_policies, post_runtime_report};

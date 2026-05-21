@@ -27,6 +27,8 @@ pub struct GatewayFullTunnelPolicy {
 pub struct DevicePolicy {
     pub policy_id: String,
     pub device_policy_id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub version: u64,
     pub role: DevicePolicyRole,
     pub network_instance_id: Uuid,
@@ -194,6 +196,7 @@ mod tests {
             r#"{{
               "policy_id": "p1",
               "device_policy_id": "p1/source",
+              "enabled": true,
               "version": 1,
               "role": "client_gateway_via_peer",
               "network_instance_id": "{}",

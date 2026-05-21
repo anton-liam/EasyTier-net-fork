@@ -31,6 +31,8 @@ pub struct GatewayFullTunnelPolicy {
 pub struct DevicePolicy {
     pub policy_id: Uuid,
     pub device_policy_id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub version: u64,
     pub role: DevicePolicyRole,
     pub machine_id: Uuid,
@@ -230,6 +232,7 @@ impl GatewayFullTunnelPolicy {
         Ok(DevicePolicy {
             policy_id: self.policy_id,
             device_policy_id: format!("{}/source", self.policy_id),
+            enabled: self.enabled,
             version: self.desired_version,
             role: DevicePolicyRole::ClientGatewayViaPeer,
             machine_id: self.source_machine_id,
@@ -258,6 +261,7 @@ impl GatewayFullTunnelPolicy {
         Ok(DevicePolicy {
             policy_id: self.policy_id,
             device_policy_id: format!("{}/exit", self.policy_id),
+            enabled: self.enabled,
             version: self.desired_version,
             role: DevicePolicyRole::ProvideExitForGateway,
             machine_id: self.exit_machine_id,
@@ -335,6 +339,13 @@ impl PolicyStore {
     }
 
     pub fn update_report(&mut self, user_id: i32, report: RuntimeReport) {
+        let mut report = report;
+        if report.easytier_ipv4.is_none() {
+            report.easytier_ipv4 = self
+                .reports
+                .get(&(user_id, report.machine_id))
+                .and_then(|existing| existing.easytier_ipv4.clone());
+        }
         if let Some((policy_id, role)) = self.report_policy_role(user_id, &report) {
             self.policy_reports.insert(
                 (user_id, policy_id, role, report.machine_id),
@@ -432,7 +443,7 @@ impl PolicyStore {
             .policies
             .iter()
             .filter_map(|((stored_user_id, _), policy)| {
-                (*stored_user_id == user_id && policy.enabled).then_some(policy)
+                (*stored_user_id == user_id).then_some(policy)
             })
         {
             if policy.source_machine_id == machine_id {
@@ -678,6 +689,7 @@ mod tests {
         let exit_policies = store.device_policies_for_machine(1, exit).unwrap();
 
         assert_eq!(source_policies.len(), 1);
+        assert!(source_policies[0].enabled);
         assert_eq!(
             source_policies[0].role,
             DevicePolicyRole::ClientGatewayViaPeer
@@ -687,6 +699,7 @@ mod tests {
             Some("10.126.126.3")
         );
         assert_eq!(exit_policies.len(), 1);
+        assert!(exit_policies[0].enabled);
         assert_eq!(
             exit_policies[0].role,
             DevicePolicyRole::ProvideExitForGateway
@@ -694,6 +707,99 @@ mod tests {
         assert_eq!(
             exit_policies[0].source_peer_ipv4.as_deref(),
             Some("10.126.126.2")
+        );
+    }
+
+    #[test]
+    fn disabled_policy_still_returns_cleanup_device_policies() {
+        let source = Uuid::new_v4();
+        let exit = Uuid::new_v4();
+        let mut policy = base_policy(source, exit);
+        policy.enabled = false;
+        let mut store = PolicyStore::default();
+        store.upsert_policy(1, policy).unwrap();
+
+        for (machine_id, easytier_ipv4) in [(source, "10.126.126.2"), (exit, "10.126.126.3")] {
+            store.update_report(
+                1,
+                RuntimeReport {
+                    machine_id,
+                    agent_version: "0.1.0".to_string(),
+                    easytier_ipv4: Some(easytier_ipv4.to_string()),
+                    last_report_at: None,
+                    policy_id: None,
+                    device_policy_id: None,
+                    version: None,
+                    role: None,
+                    status: None,
+                    observed_policy_id: None,
+                    observed_policy_version: None,
+                    observed_policy_status: None,
+                    last_error: None,
+                },
+            );
+        }
+
+        let source_policies = store.device_policies_for_machine(1, source).unwrap();
+        let exit_policies = store.device_policies_for_machine(1, exit).unwrap();
+
+        assert_eq!(source_policies.len(), 1);
+        assert_eq!(exit_policies.len(), 1);
+        assert!(!source_policies[0].enabled);
+        assert!(!exit_policies[0].enabled);
+    }
+
+    #[test]
+    fn store_keeps_machine_easytier_ip_when_policy_report_omits_it() {
+        let source = Uuid::new_v4();
+        let exit = Uuid::new_v4();
+        let policy = base_policy(source, exit);
+        let policy_id = policy.policy_id;
+        let mut store = PolicyStore::default();
+        store.upsert_policy(1, policy).unwrap();
+
+        store.update_report(
+            1,
+            RuntimeReport {
+                machine_id: exit,
+                agent_version: "0.1.0".to_string(),
+                easytier_ipv4: Some("10.126.126.3".to_string()),
+                last_report_at: Some("2026-05-16T10:00:00+00:00".to_string()),
+                policy_id: None,
+                device_policy_id: None,
+                version: None,
+                role: None,
+                status: None,
+                observed_policy_id: None,
+                observed_policy_version: None,
+                observed_policy_status: None,
+                last_error: None,
+            },
+        );
+        store.update_report(
+            1,
+            RuntimeReport {
+                machine_id: exit,
+                agent_version: "0.1.0".to_string(),
+                easytier_ipv4: None,
+                last_report_at: Some("2026-05-16T10:01:00+00:00".to_string()),
+                policy_id: Some(policy_id),
+                device_policy_id: Some(format!("{policy_id}/exit")),
+                version: Some(1),
+                role: Some(DevicePolicyRole::ProvideExitForGateway),
+                status: Some("prepared".to_string()),
+                observed_policy_id: Some(policy_id),
+                observed_policy_version: Some(1),
+                observed_policy_status: Some("prepared".to_string()),
+                last_error: None,
+            },
+        );
+
+        let source_policies = store.device_policies_for_machine(1, source).unwrap();
+
+        assert_eq!(
+            source_policies[0].exit_peer_ipv4.as_deref(),
+            Some("10.126.126.3")
         );
     }
 

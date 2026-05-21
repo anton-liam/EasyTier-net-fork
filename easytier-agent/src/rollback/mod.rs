@@ -104,6 +104,7 @@ mod tests {
         DevicePolicy {
             policy_id: "p1".to_string(),
             device_policy_id: "p1/source".to_string(),
+            enabled: true,
             version: 1,
             role: DevicePolicyRole::ClientGatewayViaPeer,
             network_instance_id: Uuid::nil(),
