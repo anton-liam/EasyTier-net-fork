@@ -13,6 +13,7 @@ pub enum ReconcileEvent {
 #[derive(Debug)]
 struct ObservedPolicy {
     version: u64,
+    enabled: bool,
     applied_at: Instant,
 }
 
@@ -48,15 +49,17 @@ impl PolicyReconciler {
             policy.validate()?;
             let observed = self.observed_versions.get(&policy.device_policy_id);
             let version_changed = observed.map(|observed| observed.version) != Some(policy.version);
+            let enabled_changed = observed.map(|observed| observed.enabled) != Some(policy.enabled);
             let reapply_due = observed.is_some_and(|observed| {
                 reapply_interval
                     .is_some_and(|interval| now.duration_since(observed.applied_at) >= interval)
             });
-            if version_changed || reapply_due {
+            if version_changed || enabled_changed || reapply_due {
                 self.observed_versions.insert(
                     policy.device_policy_id.clone(),
                     ObservedPolicy {
                         version: policy.version,
+                        enabled: policy.enabled,
                         applied_at: now,
                     },
                 );
@@ -130,6 +133,24 @@ mod tests {
             vec![ReconcileEvent::Apply("p1/source".to_string(), 2)]
         );
         assert_eq!(reconciler.observed_version("p1/source"), Some(2));
+    }
+
+    #[test]
+    fn reconcile_reapplies_when_enabled_changes() {
+        let mut reconciler = PolicyReconciler::default();
+        let enabled = policy("p1/source", 1);
+        let mut disabled = enabled.clone();
+        disabled.enabled = false;
+
+        assert_eq!(
+            reconciler.reconcile(&[enabled.clone()]).unwrap(),
+            vec![ReconcileEvent::Apply("p1/source".to_string(), 1)]
+        );
+        assert_eq!(
+            reconciler.reconcile(&[disabled.clone()]).unwrap(),
+            vec![ReconcileEvent::Apply("p1/source".to_string(), 1)]
+        );
+        assert!(reconciler.reconcile(&[disabled]).unwrap().is_empty());
     }
 
     #[test]
