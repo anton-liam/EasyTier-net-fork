@@ -290,6 +290,7 @@ web:
   main:
     dashboard: Dashboard
     device_list: Device List
+    node_list: Node List
     device_management: Device Management
     login_page: Login Page
     settings: Settings
@@ -347,105 +348,43 @@ web:
     select_existing_network_or_create_new: Select an existing network instance or create a new one to manage network settings
     disable_network: Disable Network
 
-  gateway_policy:
-    title: Gateway Policy
-    description: Configure source-to-exit forwarding for the running EasyTier network instance.
-    console_description: View source R3S to exit R3S full-tunnel policies and Agent observed state.
-    topology_button: Topology
-    configure_button: Configure Gateway Policy
-    topology_title: Gateway Policy Topology
-    create_policy: Create Gateway Policy
-    edit_policy: Edit Gateway Policy
+  node_list:
+    title: Node List
+    nodes: Nodes
+    ready_nodes: Ready
+    active_policies: Active Policies
+    node: Node
+    status: Status
+    networks: Network Instances
+    agent_observed: Agent Report
+    lan_scope: LAN Scope
+    policy: Gateway Policy
+    actions: Actions
     source_node: Source Node
     exit_node: Exit Node
-    role_source: This Node as Source
-    role_exit: This Node as Exit
-    current_node: Current Node
-    normal_node: Node
-    control_plane: Control Plane
-    control_link: control / config-server
-    gateway_link: gateway_full_tunnel
-    nat_egress: NAT / egress
-    exit_network: Exit Network
-    underlay_egress: underlay egress
-    legend_control: Control Plane Link
-    legend_peer: EasyTier Peer
-    legend_gateway: Gateway Traffic
-    status_not_configured: Not Configured
-    status_disabled: Disabled
-    status_waiting_report: Waiting for Agent Report
-    status_version_mismatch: Version Mismatch
-    status_applied: Applied
-    status_needs_check: Needs Check
-    no_policy_for_instance: No gateway policy exists for this source node and network instance
-    no_related_policy_for_node: No gateway policy is related to this node in the current network.
-    loading_policy_state: Loading gateway policy state...
-    device_traffic: Device Traffic
-    device_traffic_label: Device Traffic
-    managed_scope: Managed Traffic
-    role_ipv4: EasyTier IPv4
-    current_source_policy: Current Source Policy
-    ingress_iface: Ingress Interface
-    test_exit: Test Exit
-    exit_egress: Exit Egress
-    desired: Desired
-    observed: Observed
-    exit_test_result: Exit Test Result
-    enabled: enabled
-    policy_disabled: Policy is disabled
-    running_current_network: is running in the current network
-    source_not_in_network: Source node is not in the current network instance
-    exit_not_in_network: Exit node is not in the current network instance
-    source_ipv4_missing: Source node has not reported EasyTier IPv4
-    exit_ipv4_missing: Exit node has not reported EasyTier IPv4
-    source_status_is: Source status is
-    exit_status_is: Exit status is
-    managed_scope_ok: Managed CIDRs or device traffic is configured
-    managed_scope_empty: Managed CIDRs are empty and device traffic is disabled
-    check_policy_enabled: Policy Enabled
-    check_source_online: Source Online
-    check_exit_online: Exit Online
-    check_source_ipv4: Source EasyTier IPv4
-    check_exit_ipv4: Exit EasyTier IPv4
-    check_source_status: Source Policy Status
-    check_exit_status: Exit Policy Status
-    check_source_version: Source Version Aligned
-    check_exit_version: Exit Version Aligned
-    check_managed_scope: Managed Traffic Scope
-    network_instance_id: Network Instance ID
-    select_common_network: Select a shared source/exit network instance
-    managed_cidrs: Managed CIDRs, one per line
-    ingress_ifaces: Ingress interfaces, optional, one per line
-    include_device_traffic: Include ordinary device outbound traffic
-    enable_policy: Enable policy
-    error_select_source: Select a source node
-    error_select_exit: Select an exit node
-    error_same_source_exit: Source and exit nodes must be different
-    error_no_common_network: Source and exit nodes do not share an EasyTier network instance
-    error_select_network: Select an EasyTier network instance id
-    error_empty_scope: Include device traffic when managed CIDRs are empty
-    disabled_not_connected: Node is not connected to the Web console
-    disabled_select_network: Select an EasyTier network instance
-    disabled_network_not_running: Current network is not running
-    disabled_network_error: "Current network has an error: {error}"
-    disabled_node_not_in_network: Current node is not running this network instance
-    disabled_no_exit_peer: No peer in the current network can be used as an exit node
-    valid: Valid
-    invalid: Invalid
-    confirm_enable_policy: Enabling this policy changes the target nodes desired state. The actual traffic switch result must be confirmed from observed state. Continue?
-    confirm_edit_enabled_policy: Editing an enabled policy may trigger an exit switch. Web only changes desired state; observed source/exit state confirms completion. Continue?
-    load_failed: Failed to load gateway policies
-    empty_title: No gateway policies yet
-    empty_description: Create a policy to switch managed traffic from any source R3S to any exit R3S.
-    enabled_column: Enabled
-    policy_status: Policy Status
-    managed_cidrs_column: Managed CIDRs
-    source_status: Source Status
-    exit_status: Exit Status
-    version: Version
-    last_error: Last Error
-    actions: Actions
-    policy_detail: Policy Detail
+    network_instance: Network Instance
+    network_auto: Auto Select or Create gateway-default
+    apply_gateway: Set Gateway
+    gateway_dialog_title: Set Gateway Policy
+    machine_online: Machine Online
+    machine_offline: Machine Offline
+    agent_online: Agent Online
+    agent_offline: Agent Offline
+    not_configured: Not Configured
+    no_easytier_ipv4: No EasyTier IPv4
+    no_lan_cidr: No LAN CIDR
+    empty: No manageable nodes
+    load_failed: Failed to load nodes
+    apply_success: Gateway policy applied
+    apply_failed: Failed to apply gateway policy
+    disable_success: Gateway policy disabled
+    disable_failed: Failed to disable gateway policy
+    reason_offline: Node is not connected to the Web console
+    reason_agent_offline: Agent report is offline or stale
+    reason_missing_easytier_ipv4: Node has not reported EasyTier IPv4
+    reason_missing_lan_cidrs: Source node has not reported LAN CIDR
+    reason_same_as_source: Source and exit nodes must be different
+    reason_no_shared_network: Source and exit nodes do not share a running network instance
 
   network:
     title: Network

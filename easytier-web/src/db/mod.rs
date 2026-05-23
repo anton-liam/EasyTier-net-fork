@@ -1084,6 +1084,7 @@ mod tests {
                 observed_policy_version: Some(policy.desired_version),
                 observed_policy_status: Some("active".to_string()),
                 last_error: None,
+                ..Default::default()
             },
         )
         .await
@@ -1131,6 +1132,7 @@ mod tests {
                     observed_policy_version: Some(1),
                     observed_policy_status: Some(status.to_string()),
                     last_error: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -1155,7 +1157,11 @@ mod tests {
     #[tokio::test]
     async fn gateway_policy_report_without_ipv4_keeps_latest_machine_ipv4() {
         let db = Db::memory_db().await;
-        let user_id = db.auto_create_user("gateway-report-ip-user").await.unwrap().id;
+        let user_id = db
+            .auto_create_user("gateway-report-ip-user")
+            .await
+            .unwrap()
+            .id;
         let node = uuid::Uuid::new_v4();
         let policy_id = uuid::Uuid::new_v4();
 
@@ -1175,6 +1181,7 @@ mod tests {
                 observed_policy_version: None,
                 observed_policy_status: Some("prepared".to_string()),
                 last_error: None,
+                ..Default::default()
             },
         )
         .await
@@ -1196,6 +1203,7 @@ mod tests {
                 observed_policy_version: Some(1),
                 observed_policy_status: Some("prepared".to_string()),
                 last_error: None,
+                ..Default::default()
             },
         )
         .await

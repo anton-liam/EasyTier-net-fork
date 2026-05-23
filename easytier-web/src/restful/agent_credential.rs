@@ -803,6 +803,7 @@ mod tests {
                     observed_policy_version: Some(policy.desired_version),
                     observed_policy_status: Some("active".to_string()),
                     last_error: None,
+                    ..Default::default()
                 },
             )
             .await

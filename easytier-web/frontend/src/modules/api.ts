@@ -91,13 +91,48 @@ export interface GatewayPolicySnapshot {
     observed: GatewayPolicyObservedState;
 }
 
-export interface GatewayPolicyNode {
-    machine_id: string;
-    agent_version: string;
-    easytier_ipv4?: string | null;
+export interface GatewayNodeAgentView {
+    online: boolean;
     last_report_at?: string | null;
-    status: string;
+    agent_version?: string | null;
+    easytier_ipv4?: string | null;
+    easytier_iface?: string | null;
+    lan_cidrs: string[];
+    ingress_ifaces: string[];
+    default_route?: string | null;
+    firewall_backend?: string | null;
+    policy_status?: string | null;
     last_error?: string | null;
+    protected_routes: string[];
+}
+
+export interface GatewayNodeView {
+    machine_id: string;
+    hostname?: string | null;
+    public_ip?: string | null;
+    machine_online: boolean;
+    running_network_instances: string[];
+    agent: GatewayNodeAgentView;
+}
+
+export interface GatewayNodeListResponse {
+    nodes: GatewayNodeView[];
+}
+
+export type ManagedCidrsMode = 'auto';
+
+export interface QuickApplyGatewayPolicyRequest {
+    source_machine_id: string;
+    exit_machine_id: string;
+    network_instance_id?: string | null;
+    managed_cidrs_mode: ManagedCidrsMode;
+    include_device_traffic: boolean;
+}
+
+export interface QuickApplyGatewayPolicyResponse {
+    policy: GatewayPolicySnapshot;
+    selected_network_instance_id: string;
+    managed_cidrs: string[];
 }
 
 export interface MachineListItem {
@@ -243,16 +278,17 @@ export class ApiClient {
         return await this.client.get<any, GatewayPolicySnapshot[]>('/gateway-policies');
     }
 
-    public async list_gateway_nodes(): Promise<GatewayPolicyNode[]> {
-        return await this.client.get<any, GatewayPolicyNode[]>('/gateway-nodes');
+    public async list_gateway_node_views(): Promise<GatewayNodeView[]> {
+        const response = await this.client.get<any, GatewayNodeListResponse>('/gateway/nodes');
+        return response.nodes || [];
     }
 
-    public async get_gateway_policy(policyId: string): Promise<GatewayPolicySnapshot> {
-        return await this.client.get<any, GatewayPolicySnapshot>(`/gateway-policies/${policyId}`);
+    public async quick_apply_gateway_policy(request: QuickApplyGatewayPolicyRequest): Promise<QuickApplyGatewayPolicyResponse> {
+        return await this.client.post<any, QuickApplyGatewayPolicyResponse>('/gateway/quick-apply', request);
     }
 
-    public async upsert_gateway_policy(policy: GatewayFullTunnelPolicy): Promise<void> {
-        await this.client.post('/gateway-policies', policy);
+    public async disable_gateway_policy(policyId: string): Promise<GatewayPolicySnapshot> {
+        return await this.client.post<any, GatewayPolicySnapshot>(`/gateway-policies/${policyId}/disable`);
     }
 
     public async get_summary(): Promise<Summary> {

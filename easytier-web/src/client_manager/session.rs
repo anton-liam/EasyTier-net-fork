@@ -914,7 +914,7 @@ impl Session {
                             config: Some(
                                 serde_json::from_str::<NetworkConfig>(&c.network_config).unwrap(),
                             ),
-                            overwrite: false,
+                            overwrite: true,
                             source: source as i32,
                         },
                     )

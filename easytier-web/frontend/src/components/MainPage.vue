@@ -159,6 +159,13 @@ onUnmounted(() => {
                 </li>
                 <li>
                     <Button variant="text" class="w-full justify-start gap-x-3 pl-1.5 sidebar-button"
+                        severity="contrast" @click="router.push({ name: 'nodeList' })">
+                        <i class="pi pi-sitemap text-xl"></i>
+                        <span class="mb-0.5">{{ t('web.main.node_list') }}</span>
+                    </Button>
+                </li>
+                <li>
+                    <Button variant="text" class="w-full justify-start gap-x-3 pl-1.5 sidebar-button"
                         severity="contrast" @click="router.push({ name: 'login' })">
                         <i class="pi pi-sign-in text-xl"></i>
                         <span class="mb-0.5">{{ t('web.main.login_page') }}</span>

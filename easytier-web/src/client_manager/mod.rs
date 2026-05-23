@@ -8,10 +8,13 @@ use std::sync::{
 
 use dashmap::DashMap;
 use easytier::{
+    launcher::NetworkConfig,
     proto::{
         api::manage::WebClientService, rpc_types::controller::BaseController, web::HeartbeatRequest,
     },
-    rpc_service::remote_client::{self, RemoteClientManager},
+    rpc_service::remote_client::{
+        self, ListNetworkProps, PersistentConfig as _, RemoteClientManager, Storage as _,
+    },
     tunnel::TunnelListener,
     web_client::security,
 };
@@ -22,13 +25,36 @@ use tokio::sync::RwLock;
 
 use crate::FeatureFlags;
 use crate::gateway_policy::{
-    DevicePolicy, GatewayFullTunnelPolicy, GatewayPolicyNode, GatewayPolicySnapshot, PolicyStore,
-    RuntimeReport, apply_gateway_policy_to_native_network_configs,
+    DevicePolicy, GATEWAY_DEFAULT_NETWORK_NAME, GatewayFullTunnelPolicy,
+    GatewayNodeMachineSnapshot, GatewayNodeView, GatewayPolicySnapshot, PolicyError, PolicyStore,
+    QuickApplyGatewayPolicyRequest, QuickApplyGatewayPolicyResponse, RuntimeReport,
+    apply_gateway_policy_to_native_network_configs, build_gateway_node_views,
+    build_quick_apply_gateway_policy_for_network, gateway_default_network_config,
 };
 use crate::webhook::SharedWebhookConfig;
 use tokio::task::JoinSet;
 
 use crate::db::{Db, UserIdInDb, entity::user_running_network_configs};
+
+const DEFAULT_GATEWAY_PEER_URL: &str = "udp://137.220.194.19:22020/admin";
+const GATEWAY_DEFAULT_PEER_URLS_ENV: &str = "EASYTIER_GATEWAY_DEFAULT_PEER_URLS";
+
+#[derive(Debug, Clone)]
+struct GatewayDefaultNetworkTemplate {
+    instance_id: uuid::Uuid,
+    network_secret: String,
+    peer_urls: Vec<String>,
+}
+
+fn gateway_default_peer_urls() -> Vec<String> {
+    let raw = std::env::var(GATEWAY_DEFAULT_PEER_URLS_ENV)
+        .unwrap_or_else(|_| DEFAULT_GATEWAY_PEER_URL.to_string());
+    raw.split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+        .collect()
+}
 
 #[derive(rust_embed::Embed)]
 #[folder = "resources/"]
@@ -248,10 +274,9 @@ impl ClientManager {
             .write()
             .await
             .upsert_policy(user_id, policy.clone())?;
-        if policy.enabled
-            && let Err(error) = self
-                .sync_gateway_policy_to_native_networks(user_id, &policy)
-                .await
+        if let Err(error) = self
+            .sync_gateway_policy_to_native_networks(user_id, &policy)
+            .await
         {
             tracing::warn!(%error, policy_id = %policy.policy_id, "failed to sync gateway policy to native EasyTier configs");
         }
@@ -298,6 +323,78 @@ impl ClientManager {
         Ok(())
     }
 
+    async fn reconcile_gateway_policy_native_networks(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+    ) -> Result<(), anyhow::Error> {
+        let store = self.gateway_policy_store(user_id).await?;
+        let policies = store.native_sync_ready_policies_for_machine(user_id, machine_id);
+        for policy in policies {
+            if let Err(error) = self
+                .sync_gateway_policy_to_native_networks(user_id, &policy)
+                .await
+            {
+                tracing::warn!(
+                    %error,
+                    policy_id = %policy.policy_id,
+                    machine_id = %machine_id,
+                    "failed to reconcile gateway policy to native EasyTier configs"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn native_network_config_needs_sync(
+        &self,
+        user_id: UserIdInDb,
+        policy: &GatewayFullTunnelPolicy,
+    ) -> Result<bool, anyhow::Error> {
+        let store = self.gateway_policy_store(user_id).await?;
+        let exit_peer_ipv4 = store
+            .device_policies_for_machine(user_id, policy.source_machine_id)?
+            .into_iter()
+            .find(|device_policy| device_policy.policy_id == policy.policy_id)
+            .and_then(|device_policy| device_policy.exit_peer_ipv4)
+            .ok_or_else(|| anyhow::anyhow!("exit peer IPv4 is not ready"))?;
+
+        let mut desired_source_config = self
+            .handle_get_network_config(
+                (user_id, policy.source_machine_id),
+                policy.network_instance_id,
+            )
+            .await?;
+        let mut desired_exit_config = self
+            .handle_get_network_config(
+                (user_id, policy.exit_machine_id),
+                policy.network_instance_id,
+            )
+            .await?;
+        apply_gateway_policy_to_native_network_configs(
+            policy,
+            &mut desired_source_config,
+            &mut desired_exit_config,
+            &exit_peer_ipv4,
+        );
+
+        let current_source_config = self
+            .handle_get_network_config(
+                (user_id, policy.source_machine_id),
+                policy.network_instance_id,
+            )
+            .await?;
+        let current_exit_config = self
+            .handle_get_network_config(
+                (user_id, policy.exit_machine_id),
+                policy.network_instance_id,
+            )
+            .await?;
+
+        Ok(current_source_config != desired_source_config
+            || current_exit_config != desired_exit_config)
+    }
+
     pub async fn list_gateway_policies(
         &self,
         user_id: UserIdInDb,
@@ -326,12 +423,247 @@ impl ClientManager {
         Ok(store.list_policy_snapshots(user_id))
     }
 
-    pub async fn list_gateway_policy_nodes(
+    pub async fn list_gateway_node_views(
         &self,
         user_id: UserIdInDb,
-    ) -> Result<Vec<GatewayPolicyNode>, anyhow::Error> {
-        let store = self.gateway_policy_store(user_id).await?;
-        Ok(store.list_nodes(user_id))
+    ) -> Result<Vec<GatewayNodeView>, anyhow::Error> {
+        let client_urls = self.list_machine_by_user_id(user_id).await;
+        let mut machines = Vec::new();
+        for client_url in client_urls {
+            let Some(heartbeat) = self.get_heartbeat_requests(&client_url).await else {
+                continue;
+            };
+            let Some(machine_id) = heartbeat.machine_id else {
+                continue;
+            };
+            machines.push(GatewayNodeMachineSnapshot {
+                machine_id: machine_id.into(),
+                hostname: (!heartbeat.hostname.trim().is_empty()).then_some(heartbeat.hostname),
+                public_ip: Some(client_url.to_string()),
+                running_network_instances: heartbeat
+                    .running_network_instances
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            });
+        }
+
+        let reports = self
+            .storage
+            .db()
+            .list_gateway_runtime_reports(user_id)
+            .await?;
+        Ok(build_gateway_node_views(
+            machines,
+            reports,
+            chrono::Utc::now(),
+            chrono::Duration::seconds(30),
+        ))
+    }
+
+    pub async fn quick_apply_gateway_policy(
+        &self,
+        user_id: UserIdInDb,
+        request: QuickApplyGatewayPolicyRequest,
+    ) -> Result<QuickApplyGatewayPolicyResponse, anyhow::Error> {
+        let nodes = self.list_gateway_node_views(user_id).await?;
+        let selected_network_instance_id = self
+            .select_or_prepare_gateway_network_instance(user_id, &request, &nodes)
+            .await?;
+        let existing_policy = self
+            .storage
+            .db()
+            .list_gateway_policies(user_id)
+            .await?
+            .into_iter()
+            .find(|policy| policy.enabled && policy.source_machine_id == request.source_machine_id);
+        let (policy_id, desired_version) = existing_policy
+            .map(|policy| (policy.policy_id, policy.desired_version.saturating_add(1)))
+            .unwrap_or_else(|| (uuid::Uuid::new_v4(), 1));
+
+        let policy = build_quick_apply_gateway_policy_for_network(
+            &request,
+            &nodes,
+            policy_id,
+            desired_version,
+            selected_network_instance_id,
+        )?;
+        let managed_cidrs = policy.managed_cidrs.clone();
+        self.upsert_gateway_policy(user_id, policy.clone()).await?;
+        let snapshot = self
+            .get_gateway_policy_snapshot(user_id, policy.policy_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("gateway policy snapshot not found after upsert"))?;
+        Ok(QuickApplyGatewayPolicyResponse {
+            policy: snapshot,
+            selected_network_instance_id,
+            managed_cidrs,
+        })
+    }
+
+    async fn select_or_prepare_gateway_network_instance(
+        &self,
+        user_id: UserIdInDb,
+        request: &QuickApplyGatewayPolicyRequest,
+        nodes: &[GatewayNodeView],
+    ) -> Result<uuid::Uuid, anyhow::Error> {
+        if request.source_machine_id == request.exit_machine_id {
+            return Err(PolicyError::SourceEqualsExit.into());
+        }
+        let source = nodes
+            .iter()
+            .find(|node| node.machine_id == request.source_machine_id)
+            .ok_or(PolicyError::MachineOffline(request.source_machine_id))?;
+        let exit = nodes
+            .iter()
+            .find(|node| node.machine_id == request.exit_machine_id)
+            .ok_or(PolicyError::MachineOffline(request.exit_machine_id))?;
+
+        if !source.machine_online {
+            return Err(PolicyError::MachineOffline(source.machine_id).into());
+        }
+        if !exit.machine_online {
+            return Err(PolicyError::MachineOffline(exit.machine_id).into());
+        }
+        if !source.agent.online {
+            return Err(PolicyError::AgentReportStale(source.machine_id).into());
+        }
+        if !exit.agent.online {
+            return Err(PolicyError::AgentReportStale(exit.machine_id).into());
+        }
+
+        if let Some(network_instance_id) = request.network_instance_id {
+            return source
+                .running_network_instances
+                .contains(&network_instance_id)
+                .then_some(())
+                .and_then(|_| {
+                    exit.running_network_instances
+                        .contains(&network_instance_id)
+                        .then_some(network_instance_id)
+                })
+                .ok_or_else(|| PolicyError::NetworkInstanceNotReady.into());
+        }
+
+        let mut source_networks = source.running_network_instances.clone();
+        source_networks.sort();
+        if let Some(network_id) = source_networks
+            .into_iter()
+            .find(|network_id| exit.running_network_instances.contains(network_id))
+        {
+            return Ok(network_id);
+        }
+
+        self.prepare_gateway_default_network(user_id, source, exit)
+            .await
+    }
+
+    async fn prepare_gateway_default_network(
+        &self,
+        user_id: UserIdInDb,
+        source: &GatewayNodeView,
+        exit: &GatewayNodeView,
+    ) -> Result<uuid::Uuid, anyhow::Error> {
+        let template = self
+            .load_gateway_default_network_template(user_id, source.machine_id, exit.machine_id)
+            .await?;
+        let source_config = gateway_default_network_config(
+            template.instance_id,
+            template.network_secret.clone(),
+            source.hostname.clone(),
+            template.peer_urls.clone(),
+        );
+        let exit_config = gateway_default_network_config(
+            template.instance_id,
+            template.network_secret,
+            exit.hostname.clone(),
+            template.peer_urls,
+        );
+
+        self.handle_run_network_instance((user_id, source.machine_id), source_config, true)
+            .await?;
+        self.handle_run_network_instance((user_id, exit.machine_id), exit_config, true)
+            .await?;
+        Ok(template.instance_id)
+    }
+
+    async fn load_gateway_default_network_template(
+        &self,
+        user_id: UserIdInDb,
+        source_machine_id: uuid::Uuid,
+        exit_machine_id: uuid::Uuid,
+    ) -> Result<GatewayDefaultNetworkTemplate, anyhow::Error> {
+        let existing = self
+            .find_gateway_default_network_config(user_id, source_machine_id)
+            .await?
+            .or(self
+                .find_gateway_default_network_config(user_id, exit_machine_id)
+                .await?);
+
+        if let Some((instance_id, config)) = existing {
+            let network_secret = config
+                .network_secret
+                .filter(|secret| !secret.trim().is_empty())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let peer_urls = if config.peer_urls.is_empty() {
+                gateway_default_peer_urls()
+            } else {
+                config.peer_urls
+            };
+            return Ok(GatewayDefaultNetworkTemplate {
+                instance_id,
+                network_secret,
+                peer_urls,
+            });
+        }
+
+        Ok(GatewayDefaultNetworkTemplate {
+            instance_id: uuid::Uuid::new_v4(),
+            network_secret: uuid::Uuid::new_v4().to_string(),
+            peer_urls: gateway_default_peer_urls(),
+        })
+    }
+
+    async fn find_gateway_default_network_config(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+    ) -> Result<Option<(uuid::Uuid, NetworkConfig)>, anyhow::Error> {
+        for row in self
+            .storage
+            .db()
+            .list_network_configs((user_id, machine_id), ListNetworkProps::All)
+            .await?
+        {
+            let config = row.get_network_config()?;
+            if config.network_name.as_deref() != Some(GATEWAY_DEFAULT_NETWORK_NAME) {
+                continue;
+            }
+            let instance_id = uuid::Uuid::parse_str(row.get_network_inst_id())?;
+            return Ok(Some((instance_id, config)));
+        }
+        Ok(None)
+    }
+
+    pub async fn disable_gateway_policy(
+        &self,
+        user_id: UserIdInDb,
+        policy_id: uuid::Uuid,
+    ) -> Result<GatewayPolicySnapshot, anyhow::Error> {
+        let mut policy = self
+            .storage
+            .db()
+            .list_gateway_policies(user_id)
+            .await?
+            .into_iter()
+            .find(|policy| policy.policy_id == policy_id)
+            .ok_or(PolicyError::PolicyNotFound)?;
+        policy.enabled = false;
+        policy.desired_version = policy.desired_version.saturating_add(1);
+        self.upsert_gateway_policy(user_id, policy.clone()).await?;
+        self.get_gateway_policy_snapshot(user_id, policy_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("gateway policy snapshot not found after disable"))
     }
 
     pub async fn gateway_device_policies(
@@ -368,6 +700,7 @@ impl ClientManager {
         user_id: UserIdInDb,
         report: RuntimeReport,
     ) -> Result<(), anyhow::Error> {
+        let machine_id = report.machine_id;
         self.storage
             .db()
             .upsert_gateway_runtime_report(user_id, report.clone())
@@ -376,6 +709,36 @@ impl ClientManager {
             .write()
             .await
             .update_report(user_id, report);
+        let store = self.gateway_policy_store(user_id).await?;
+        for policy in store.native_sync_ready_policies_for_machine(user_id, machine_id) {
+            match self
+                .native_network_config_needs_sync(user_id, &policy)
+                .await
+            {
+                Ok(true) => {
+                    if let Err(error) = self
+                        .sync_gateway_policy_to_native_networks(user_id, &policy)
+                        .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            policy_id = %policy.policy_id,
+                            machine_id = %machine_id,
+                            "failed to sync gateway policy after runtime report"
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        policy_id = %policy.policy_id,
+                        machine_id = %machine_id,
+                        "failed to check native gateway policy sync after runtime report"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -508,7 +871,88 @@ mod tests {
     };
     use sqlx::Executor;
 
-    use crate::{FeatureFlags, client_manager::ClientManager, db::Db};
+    use crate::{
+        FeatureFlags,
+        client_manager::ClientManager,
+        db::Db,
+        gateway_policy::{
+            ExitEgress, GatewayFullTunnelPolicy, HealthcheckConfig, PolicyStore, RollbackConfig,
+            RuntimeReport,
+        },
+    };
+
+    #[tokio::test]
+    async fn gateway_native_sync_is_reconciled_after_reports_arrive() {
+        let source = uuid::Uuid::new_v4();
+        let exit = uuid::Uuid::new_v4();
+        let policy = GatewayFullTunnelPolicy {
+            policy_id: uuid::Uuid::new_v4(),
+            enabled: true,
+            network_instance_id: uuid::Uuid::new_v4(),
+            source_machine_id: source,
+            managed_cidrs: vec!["192.168.100.0/24".to_string()],
+            ingress_ifaces: vec!["br-lan".to_string()],
+            include_device_traffic: false,
+            exit_machine_id: exit,
+            exit_egress: ExitEgress::default(),
+            desired_version: 1,
+            protect_control_plane: true,
+            healthcheck: HealthcheckConfig::default(),
+            rollback: RollbackConfig::default(),
+        };
+
+        let mut store = PolicyStore::default();
+        store.upsert_policy(1, policy).unwrap();
+        store.update_report(
+            1,
+            RuntimeReport {
+                machine_id: source,
+                agent_version: "0.1.0".to_string(),
+                easytier_ipv4: Some("10.126.126.2".to_string()),
+                last_report_at: None,
+                policy_id: None,
+                device_policy_id: None,
+                version: None,
+                role: None,
+                status: None,
+                observed_policy_id: None,
+                observed_policy_version: None,
+                observed_policy_status: None,
+                last_error: None,
+                ..Default::default()
+            },
+        );
+        assert!(
+            store
+                .native_sync_ready_policies_for_machine(1, source)
+                .is_empty()
+        );
+        store.update_report(
+            1,
+            RuntimeReport {
+                machine_id: exit,
+                agent_version: "0.1.0".to_string(),
+                easytier_ipv4: Some("10.126.126.3".to_string()),
+                last_report_at: None,
+                policy_id: None,
+                device_policy_id: None,
+                version: None,
+                role: None,
+                status: None,
+                observed_policy_id: None,
+                observed_policy_version: None,
+                observed_policy_status: None,
+                last_error: None,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            store
+                .native_sync_ready_policies_for_machine(1, source)
+                .len(),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn test_client() {

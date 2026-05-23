@@ -11,6 +11,18 @@ pub struct AgentRuntimeReport {
     pub agent_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub easytier_ipv4: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub easytier_iface: Option<String>,
+    #[serde(default)]
+    pub lan_cidrs: Vec<String>,
+    #[serde(default)]
+    pub ingress_ifaces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_route: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firewall_backend: Option<String>,
+    #[serde(default)]
+    pub protected_routes: Vec<String>,
     pub policy_id: String,
     pub device_policy_id: String,
     pub version: u64,
@@ -22,6 +34,40 @@ pub struct AgentRuntimeReport {
     pub dry_run: bool,
     pub executed_count: usize,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentRuntimeObservation {
+    pub easytier_iface: Option<String>,
+    pub lan_cidrs: Vec<String>,
+    pub ingress_ifaces: Vec<String>,
+    pub default_route: Option<String>,
+    pub firewall_backend: Option<String>,
+    pub protected_routes: Vec<String>,
+}
+
+impl AgentRuntimeReport {
+    pub fn with_observation(mut self, observation: AgentRuntimeObservation) -> Self {
+        if observation.easytier_iface.is_some() {
+            self.easytier_iface = observation.easytier_iface;
+        }
+        if !observation.lan_cidrs.is_empty() {
+            self.lan_cidrs = observation.lan_cidrs;
+        }
+        if !observation.ingress_ifaces.is_empty() {
+            self.ingress_ifaces = observation.ingress_ifaces;
+        }
+        if observation.default_route.is_some() {
+            self.default_route = observation.default_route;
+        }
+        if observation.firewall_backend.is_some() {
+            self.firewall_backend = observation.firewall_backend;
+        }
+        if !observation.protected_routes.is_empty() {
+            self.protected_routes = observation.protected_routes;
+        }
+        self
+    }
 }
 
 pub fn build_runtime_report(
@@ -36,6 +82,12 @@ pub fn build_runtime_report(
         machine_id: machine_id.into(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         easytier_ipv4,
+        easytier_iface: Some(policy.easytier_iface.clone()),
+        lan_cidrs: policy.managed_cidrs.clone(),
+        ingress_ifaces: policy.ingress_ifaces.clone(),
+        default_route: None,
+        firewall_backend: None,
+        protected_routes: Vec::new(),
         policy_id: policy.policy_id.clone(),
         device_policy_id: policy.device_policy_id.clone(),
         version: policy.version,
@@ -74,6 +126,12 @@ pub fn build_idle_runtime_report(
         machine_id: machine_id.into(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         easytier_ipv4,
+        easytier_iface: None,
+        lan_cidrs: Vec::new(),
+        ingress_ifaces: Vec::new(),
+        default_route: None,
+        firewall_backend: None,
+        protected_routes: Vec::new(),
         policy_id: String::new(),
         device_policy_id: String::new(),
         version: 0,
@@ -213,6 +271,11 @@ mod tests {
         assert_eq!(json["observed_policy_version"], 2);
         assert_eq!(json["observed_policy_status"], "active");
         assert_eq!(json["easytier_ipv4"], "10.126.126.2");
+        assert_eq!(json["easytier_iface"], "easytier0");
+        assert_eq!(json["lan_cidrs"], serde_json::json!(["192.168.10.0/24"]));
+        assert_eq!(json["ingress_ifaces"], serde_json::json!(["br-lan"]));
+        assert_eq!(json["firewall_backend"], serde_json::Value::Null);
+        assert_eq!(json["protected_routes"], serde_json::json!([]));
     }
 
     #[test]
@@ -227,6 +290,9 @@ mod tests {
         assert_eq!(report.role, "");
         assert_eq!(report.status, PolicyStatus::Prepared);
         assert_eq!(json["easytier_ipv4"], "10.126.126.2");
+        assert_eq!(json["lan_cidrs"], serde_json::json!([]));
+        assert_eq!(json["ingress_ifaces"], serde_json::json!([]));
+        assert_eq!(json["protected_routes"], serde_json::json!([]));
     }
 
     #[test]
@@ -276,7 +342,10 @@ mod tests {
     fn disabled_policy_reports_disabled_after_cleanup() {
         let mut policy = policy();
         policy.enabled = false;
-        let commands = vec![CommandPlan::new("ip", ["rule", "del", "from", "192.168.10.0/24"])];
+        let commands = vec![CommandPlan::new(
+            "ip",
+            ["rule", "del", "from", "192.168.10.0/24"],
+        )];
         let mut executor = NoopExecutor;
         let command_report =
             apply_command_plan(commands, CommandExecutionMode::Execute, &mut executor).unwrap();
@@ -286,7 +355,6 @@ mod tests {
             PolicyStatus::Disabled
         );
     }
-
 
     #[test]
     fn derives_degraded_when_last_error_exists() {

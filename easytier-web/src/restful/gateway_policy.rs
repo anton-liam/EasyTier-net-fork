@@ -6,7 +6,8 @@ use axum_login::AuthUser;
 
 use crate::db::UserIdInDb;
 use crate::gateway_policy::{
-    GatewayFullTunnelPolicy, GatewayPolicyNode, GatewayPolicySnapshot, PolicyError, RuntimeReport,
+    GatewayNodeView, GatewayPolicySnapshot, PolicyError, QuickApplyGatewayPolicyRequest,
+    QuickApplyGatewayPolicyResponse, RuntimeReport,
 };
 
 use super::users::AuthSession;
@@ -32,6 +33,11 @@ fn convert_anyhow_error(e: anyhow::Error) -> (StatusCode, Json<Error>) {
 
 pub struct GatewayPolicyApi;
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct GatewayNodeListResponse {
+    nodes: Vec<GatewayNodeView>,
+}
+
 impl GatewayPolicyApi {
     fn get_user_id(auth_session: &AuthSession) -> Result<UserIdInDb, (StatusCode, Json<Error>)> {
         let Some(user_id) = auth_session.user.as_ref().map(|x| x.id()) else {
@@ -41,19 +47,6 @@ impl GatewayPolicyApi {
             ));
         };
         Ok(user_id)
-    }
-
-    async fn handle_upsert_policy(
-        auth_session: AuthSession,
-        State(client_mgr): AppState,
-        Json(policy): Json<GatewayFullTunnelPolicy>,
-    ) -> Result<StatusCode, HttpHandleError> {
-        let user_id = Self::get_user_id(&auth_session)?;
-        client_mgr
-            .upsert_gateway_policy(user_id, policy)
-            .await
-            .map_err(convert_anyhow_error)?;
-        Ok(StatusCode::NO_CONTENT)
     }
 
     async fn handle_list_policies(
@@ -88,14 +81,42 @@ impl GatewayPolicyApi {
         Ok(Json(snapshot))
     }
 
-    async fn handle_list_nodes(
+    async fn handle_list_node_views(
         auth_session: AuthSession,
         State(client_mgr): AppState,
-    ) -> Result<Json<Vec<GatewayPolicyNode>>, HttpHandleError> {
+    ) -> Result<Json<GatewayNodeListResponse>, HttpHandleError> {
+        let user_id = Self::get_user_id(&auth_session)?;
+        Ok(Json(GatewayNodeListResponse {
+            nodes: client_mgr
+                .list_gateway_node_views(user_id)
+                .await
+                .map_err(convert_anyhow_error)?,
+        }))
+    }
+
+    async fn handle_quick_apply(
+        auth_session: AuthSession,
+        State(client_mgr): AppState,
+        Json(request): Json<QuickApplyGatewayPolicyRequest>,
+    ) -> Result<Json<QuickApplyGatewayPolicyResponse>, HttpHandleError> {
         let user_id = Self::get_user_id(&auth_session)?;
         Ok(Json(
             client_mgr
-                .list_gateway_policy_nodes(user_id)
+                .quick_apply_gateway_policy(user_id, request)
+                .await
+                .map_err(convert_anyhow_error)?,
+        ))
+    }
+
+    async fn handle_disable_policy(
+        auth_session: AuthSession,
+        State(client_mgr): AppState,
+        Path(policy_id): Path<uuid::Uuid>,
+    ) -> Result<Json<GatewayPolicySnapshot>, HttpHandleError> {
+        let user_id = Self::get_user_id(&auth_session)?;
+        Ok(Json(
+            client_mgr
+                .disable_gateway_policy(user_id, policy_id)
                 .await
                 .map_err(convert_anyhow_error)?,
         ))
@@ -131,15 +152,20 @@ impl GatewayPolicyApi {
 
     pub fn build_route() -> Router<AppStateInner> {
         Router::new()
-            .route(
-                "/api/v1/gateway-policies",
-                get(Self::handle_list_policies).post(Self::handle_upsert_policy),
-            )
+            .route("/api/v1/gateway-policies", get(Self::handle_list_policies))
             .route(
                 "/api/v1/gateway-policies/:policy-id",
-                get(Self::handle_get_policy).put(Self::handle_upsert_policy),
+                get(Self::handle_get_policy),
             )
-            .route("/api/v1/gateway-nodes", get(Self::handle_list_nodes))
+            .route(
+                "/api/v1/gateway-policies/:policy-id/disable",
+                post(Self::handle_disable_policy),
+            )
+            .route("/api/v1/gateway/nodes", get(Self::handle_list_node_views))
+            .route(
+                "/api/v1/gateway/quick-apply",
+                post(Self::handle_quick_apply),
+            )
     }
 
     pub fn build_route_internal() -> Router<AppStateInner> {
@@ -262,7 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_policy_rest_round_trip_lists_observed_snapshots() {
-        let (base_url, _db, user_id, _server) = test_server().await;
+        let (base_url, db, user_id, _server) = test_server().await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let source = uuid::Uuid::new_v4();
         let exit = uuid::Uuid::new_v4();
@@ -287,14 +313,9 @@ mod tests {
             "login headers: {login_headers:?}, body: {login_body}"
         );
 
-        let upsert = client
-            .post(format!("{}/api/v1/gateway-policies", base_url))
-            .header(header::COOKIE, cookie.clone())
-            .json(&policy)
-            .send()
+        db.upsert_gateway_policy(user_id, policy.clone())
             .await
             .unwrap();
-        assert_eq!(upsert.status(), StatusCode::NO_CONTENT);
 
         for (machine_id, easytier_ipv4, status) in [
             (source, "10.126.126.2", "active"),
@@ -326,6 +347,7 @@ mod tests {
                 observed_policy_version: Some(policy.desired_version),
                 observed_policy_status: Some(status.to_string()),
                 last_error: None,
+                ..Default::default()
             };
             let response = client
                 .post(format!(
@@ -337,7 +359,13 @@ mod tests {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            let response_status = response.status();
+            let response_body = response.text().await.unwrap();
+            assert_eq!(
+                response_status,
+                StatusCode::NO_CONTENT,
+                "gateway report response body: {response_body}"
+            );
         }
 
         let snapshot = client
@@ -357,24 +385,6 @@ mod tests {
         );
         assert_eq!(snapshot_body["observed"]["source"]["status"], "active");
         assert_eq!(snapshot_body["observed"]["exit"]["status"], "prepared");
-
-        let nodes = client
-            .get(format!("{}/api/v1/gateway-nodes", base_url))
-            .header(header::COOKIE, cookie.clone())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(nodes.status(), StatusCode::OK);
-        let nodes_body = nodes.json::<serde_json::Value>().await.unwrap();
-        assert_eq!(nodes_body.as_array().unwrap().len(), 2);
-        assert!(
-            nodes_body
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|node| node["machine_id"] == source.to_string()
-                    && node["easytier_ipv4"] == "10.126.126.2")
-        );
 
         let list = client
             .get(format!("{}/api/v1/gateway-policies", base_url))

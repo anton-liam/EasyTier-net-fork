@@ -22,20 +22,39 @@ impl OpenWrtBackend {
     fn source_apply(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
         let exit_peer = policy.exit_peer_ipv4.as_deref().unwrap_or_default();
         let easytier_iface = policy.easytier_iface.as_str();
-        let mut commands = vec![CommandPlan::new(
-            "ip",
-            [
-                "route",
-                "replace",
-                "default",
-                "via",
-                exit_peer,
-                "dev",
-                easytier_iface,
-                "table",
-                &self.table_id.to_string(),
-            ],
-        )];
+        let mut commands = vec![
+            CommandPlan::new(
+                "ip",
+                [
+                    "route",
+                    "replace",
+                    "default",
+                    "via",
+                    exit_peer,
+                    "dev",
+                    easytier_iface,
+                    "table",
+                    &self.table_id.to_string(),
+                ],
+            ),
+            CommandPlan::new(
+                "ip",
+                [
+                    "route",
+                    "replace",
+                    "blackhole",
+                    "default",
+                    "table",
+                    &self.table_id.to_string(),
+                    "metric",
+                    "32767",
+                ],
+            ),
+        ];
+
+        for iface in &policy.ingress_ifaces {
+            commands.push(ingress_local_ip_rule_command(iface, self.table_id, "add"));
+        }
 
         for cidr in policy
             .managed_cidrs
@@ -52,6 +71,18 @@ impl OpenWrtBackend {
                     ),
                 ],
             ));
+            for iface in &policy.ingress_ifaces {
+                commands.push(CommandPlan::new(
+                    "sh",
+                    [
+                        "-c",
+                        &format!(
+                            "ip rule del iif {iface} from {cidr} lookup {table} 2>/dev/null || true; ip rule add iif {iface} from {cidr} lookup {table}",
+                            table = self.table_id
+                        ),
+                    ],
+                ));
+            }
         }
 
         if policy
@@ -97,11 +128,91 @@ impl OpenWrtBackend {
             ));
         }
 
+        let delete_forward_rule = nft_delete_forward_rule_command(&policy.device_policy_id);
+        let delete_mss_rule = nft_delete_mangle_forward_rule_command(&policy.device_policy_id);
+        commands.push(CommandPlan::new("sh", ["-c", &delete_forward_rule]));
+        commands.push(CommandPlan::new("sh", ["-c", &delete_mss_rule]));
+        for cidr in policy
+            .managed_cidrs
+            .iter()
+            .filter(|cidr| !is_ipv4_default_route(cidr))
+        {
+            commands.push(CommandPlan::new(
+                "sh",
+                [
+                    "-c",
+                    &format!(
+                        "nft insert rule inet fw4 forward ip saddr {} oifname {} accept comment {}",
+                        nft_string(cidr),
+                        nft_string(easytier_iface),
+                        nft_string(&policy.device_policy_id)
+                    ),
+                ],
+            ));
+            commands.push(CommandPlan::new(
+                "sh",
+                [
+                    "-c",
+                    &format!(
+                        "nft insert rule inet fw4 forward ip saddr {} oifname != {} drop comment {}",
+                        nft_string(cidr),
+                        nft_string(easytier_iface),
+                        nft_string(&policy.device_policy_id)
+                    ),
+                ],
+            ));
+        }
+        if policy
+            .managed_cidrs
+            .iter()
+            .any(|cidr| is_ipv4_default_route(cidr))
+        {
+            for iface in &policy.ingress_ifaces {
+                commands.push(CommandPlan::new(
+                    "sh",
+                    [
+                        "-c",
+                        &format!(
+                            "nft insert rule inet fw4 forward iifname {} oifname {} accept comment {}",
+                            nft_string(iface),
+                            nft_string(easytier_iface),
+                            nft_string(&policy.device_policy_id)
+                        ),
+                    ],
+                ));
+                commands.push(CommandPlan::new(
+                    "sh",
+                    [
+                        "-c",
+                        &format!(
+                            "nft insert rule inet fw4 forward iifname {} oifname != {} drop comment {}",
+                            nft_string(iface),
+                            nft_string(easytier_iface),
+                            nft_string(&policy.device_policy_id)
+                        ),
+                    ],
+                ));
+            }
+        }
+        commands.push(CommandPlan::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    "nft insert rule inet fw4 mangle_forward tcp flags syn tcp option maxseg size set 1220 comment {}",
+                    nft_string(&policy.device_policy_id)
+                ),
+            ],
+        ));
+
         commands
     }
 
     fn source_cleanup(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
         let mut commands = Vec::new();
+        for iface in &policy.ingress_ifaces {
+            commands.push(ingress_local_ip_rule_command(iface, self.table_id, "del"));
+        }
         for cidr in policy
             .managed_cidrs
             .iter()
@@ -117,6 +228,18 @@ impl OpenWrtBackend {
                     ),
                 ],
             ));
+            for iface in &policy.ingress_ifaces {
+                commands.push(CommandPlan::new(
+                    "sh",
+                    [
+                        "-c",
+                        &format!(
+                            "ip rule del iif {iface} from {cidr} lookup {table} 2>/dev/null || true",
+                            table = self.table_id
+                        ),
+                    ],
+                ));
+            }
         }
         if policy
             .managed_cidrs
@@ -149,6 +272,20 @@ impl OpenWrtBackend {
                 ],
             ));
         }
+        commands.push(CommandPlan::new(
+            "sh",
+            [
+                "-c",
+                &nft_delete_forward_rule_command(&policy.device_policy_id),
+            ],
+        ));
+        commands.push(CommandPlan::new(
+            "sh",
+            [
+                "-c",
+                &nft_delete_mangle_forward_rule_command(&policy.device_policy_id),
+            ],
+        ));
         commands.push(CommandPlan::new(
             "sh",
             [
@@ -203,6 +340,16 @@ impl OpenWrtBackend {
             CommandPlan::new("sysctl", ["-w", "net.ipv4.ip_forward=1"]),
             CommandPlan::new("sh", ["-c", &batch]),
             CommandPlan::new("fw4", ["reload"]),
+            CommandPlan::new(
+                "sh",
+                [
+                    "-c",
+                    &format!(
+                        "ip rule del pref 100 iif {iface} lookup main 2>/dev/null || true; ip rule add pref 100 iif {iface} lookup main",
+                        iface = easytier_iface
+                    ),
+                ],
+            ),
             CommandPlan::new("sh", ["-c", &delete_forward_rule]),
             CommandPlan::new("sh", ["-c", &add_forward_rule]),
         ]
@@ -259,6 +406,16 @@ impl OpenWrtBackend {
             CommandPlan::new("sh", ["-c", &batch]),
             CommandPlan::new("fw4", ["reload"]),
             CommandPlan::new("sh", ["-c", &delete_forward_rule]),
+            CommandPlan::new(
+                "sh",
+                [
+                    "-c",
+                    &format!(
+                        "ip rule del pref 100 iif {iface} lookup main 2>/dev/null || true",
+                        iface = policy.easytier_iface
+                    ),
+                ],
+            ),
         ]
         .into_iter()
         .chain(
@@ -269,10 +426,7 @@ impl OpenWrtBackend {
                 .map(|cidr| {
                     CommandPlan::new(
                         "sh",
-                        [
-                            "-c",
-                            &format!("ip route del {cidr} 2>/dev/null || true"),
-                        ],
+                        ["-c", &format!("ip route del {cidr} 2>/dev/null || true")],
                     )
                 }),
         )
@@ -335,10 +489,19 @@ fn shell_single_quote(value: &str) -> String {
 }
 
 fn nft_delete_forward_rule_command(device_policy_id: &str) -> String {
+    nft_delete_chain_rule_command("forward", device_policy_id)
+}
+
+fn nft_delete_mangle_forward_rule_command(device_policy_id: &str) -> String {
+    nft_delete_chain_rule_command("mangle_forward", device_policy_id)
+}
+
+fn nft_delete_chain_rule_command(chain: &str, device_policy_id: &str) -> String {
     let quoted_comment = shell_single_quote(device_policy_id);
     format!(
-        "nft -a list chain inet fw4 forward 2>/dev/null | awk -v c={} 'index($0, c) {{ print $NF }}' | xargs -r -n1 nft delete rule inet fw4 forward handle",
-        quoted_comment
+        "nft -a list chain inet fw4 {chain} 2>/dev/null | awk -v c={} 'index($0, c) {{ print $NF }}' | xargs -r -n1 nft delete rule inet fw4 {chain} handle",
+        quoted_comment,
+        chain = chain
     )
 }
 
@@ -358,6 +521,20 @@ fn nat_sources(policy: &DevicePolicy) -> Vec<String> {
     }
     sources.extend(policy.managed_cidrs.iter().cloned());
     sources
+}
+
+fn ingress_local_ip_rule_command(iface: &str, table_id: u32, action: &str) -> CommandPlan {
+    let iface = shell_single_quote(iface);
+    let script = format!(
+        "ip -4 -o addr show dev {iface} | awk '{{print $4}}' | while read -r cidr; do \
+[ -n \"$cidr\" ] || continue; \
+ip rule {action} pref 100 from \"$cidr\" lookup {table} 2>/dev/null || true; \
+done",
+        iface = iface,
+        action = action,
+        table = table_id,
+    );
+    CommandPlan::new("sh", ["-c", &script])
 }
 
 #[cfg(test)]
@@ -421,6 +598,13 @@ mod tests {
                 .iter()
                 .any(|cmd| cmd.program == "fw4" && cmd.args == ["reload"])
         );
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "sh"
+                && cmd
+                    .args
+                    .join(" ")
+                    .contains("ip rule add pref 100 iif easytier0 lookup main")
+        }));
         assert!(
             shell_commands
                 .iter()
@@ -501,7 +685,19 @@ mod tests {
             .join("\n");
 
         assert!(command_text.contains("ip route replace default via 10.126.126.3"));
+        assert!(command_text.contains("ip route replace blackhole default table 126 metric 32767"));
+        assert!(command_text.contains("ip -4 -o addr show dev 'br-lan'"));
+        assert!(command_text.contains("ip rule add pref 100 from \"$cidr\" lookup 126"));
         assert!(command_text.contains("ip rule add from 192.168.10.0/24 lookup 126"));
+        assert!(command_text.contains(
+            "nft insert rule inet fw4 forward ip saddr \\\"192.168.10.0/24\\\" oifname \\\"easytier0\\\" accept comment \\\"p1/source\\\""
+        ));
+        assert!(command_text.contains(
+            "nft insert rule inet fw4 forward ip saddr \\\"192.168.10.0/24\\\" oifname != \\\"easytier0\\\" drop comment \\\"p1/source\\\""
+        ));
+        assert!(command_text.contains(
+            "nft insert rule inet fw4 mangle_forward tcp flags syn tcp option maxseg size set 1220 comment \\\"p1/source\\\""
+        ));
         assert!(!command_text.contains("set firewall.@zone"));
         assert!(!command_text.contains("network.wan"));
         assert!(!command_text.contains("network.lan"));
@@ -523,6 +719,12 @@ mod tests {
 
         assert!(command_text.contains("ip rule add iif br-lan lookup 126"));
         assert!(command_text.contains("ip rule del from 0.0.0.0/0 lookup 126"));
+        assert!(command_text.contains(
+            "nft insert rule inet fw4 forward iifname \\\"br-lan\\\" oifname \\\"easytier0\\\" accept comment \\\"p1/source\\\""
+        ));
+        assert!(command_text.contains(
+            "nft insert rule inet fw4 forward iifname \\\"br-lan\\\" oifname != \\\"easytier0\\\" drop comment \\\"p1/source\\\""
+        ));
         assert!(!command_text.contains("ip rule add from 0.0.0.0/0 lookup 126"));
     }
 
@@ -538,7 +740,28 @@ mod tests {
                 && cmd
                     .args
                     .join(" ")
+                    .contains("nft -a list chain inet fw4 forward")
+        }));
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "sh"
+                && cmd
+                    .args
+                    .join(" ")
+                    .contains("nft -a list chain inet fw4 mangle_forward")
+        }));
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "sh"
+                && cmd
+                    .args
+                    .join(" ")
                     .contains("ip route flush table 126 2>/dev/null || true")
+        }));
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "sh"
+                && cmd
+                    .args
+                    .join(" ")
+                    .contains("ip rule del pref 100 from \"$cidr\" lookup 126")
         }));
     }
 
@@ -555,6 +778,13 @@ mod tests {
                     .args
                     .join(" ")
                     .contains("ip route flush table 126 2>/dev/null || true")
+        }));
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "sh"
+                && cmd
+                    .args
+                    .join(" ")
+                    .contains("ip rule del pref 100 iif easytier0 lookup main")
         }));
     }
 

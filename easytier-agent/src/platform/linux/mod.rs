@@ -48,7 +48,7 @@ impl LinuxBackend {
 
     fn delete_nft_rules_by_comment_command(&self, chain: &str, comment: &str) -> CommandPlan {
         let script = format!(
-            "nft -a list chain inet {} {} 2>/dev/null | awk -v comment=\"$1\" '$0 ~ \"comment \\\\\"\" comment \"\\\\\"\" {{ print $NF }}' | while read handle; do nft delete rule inet {} {} handle \"$handle\"; done",
+            "nft -a list chain inet {} {} 2>/dev/null | awk -v c=\"$1\" 'index($0, c) {{ print $NF }}' | while read -r handle; do [ -n \"$handle\" ] && nft delete rule inet {} {} handle \"$handle\"; done",
             self.nft_table, chain, self.nft_table, chain
         );
         CommandPlan::new("sh", ["-c", &script, "easytier-agent-cleanup", comment])
@@ -73,6 +73,19 @@ impl LinuxBackend {
                     &self.table_id.to_string(),
                 ],
             ),
+            CommandPlan::new(
+                "ip",
+                [
+                    "route",
+                    "replace",
+                    "blackhole",
+                    "default",
+                    "table",
+                    &self.table_id.to_string(),
+                    "metric",
+                    "32767",
+                ],
+            ),
         ];
 
         for cidr in &policy.managed_cidrs {
@@ -86,6 +99,119 @@ impl LinuxBackend {
                     ),
                 ],
             ));
+            for iface in &policy.ingress_ifaces {
+                commands.push(CommandPlan::new(
+                    "sh",
+                    [
+                        "-c",
+                        &format!(
+                            "ip rule del iif {iface} from {cidr} lookup {table} 2>/dev/null || true; ip rule add iif {iface} from {cidr} lookup {table}",
+                            table = self.table_id
+                        ),
+                    ],
+                ));
+            }
+        }
+
+        for iface in &policy.ingress_ifaces {
+            commands.push(ingress_local_ip_rule_command(iface, self.table_id, "add"));
+        }
+
+        let nft_table = &self.nft_table;
+        let forward_chain = format!(
+            "nft list chain inet {nft_table} forward >/dev/null 2>&1 || nft add chain inet {nft_table} forward '{{ type filter hook forward priority filter; }}'"
+        );
+        commands.push(self.ensure_nft_table_command());
+        commands.push(CommandPlan::new("sh", ["-c", &forward_chain]));
+        commands
+            .push(self.delete_nft_rules_by_comment_command("forward", &policy.device_policy_id));
+
+        for cidr in policy
+            .managed_cidrs
+            .iter()
+            .filter(|cidr| cidr.trim() != "0.0.0.0/0")
+        {
+            commands.push(CommandPlan::new(
+                "nft",
+                [
+                    "add",
+                    "rule",
+                    "inet",
+                    &self.nft_table,
+                    "forward",
+                    "ip",
+                    "saddr",
+                    cidr,
+                    "oifname",
+                    easytier_iface,
+                    "accept",
+                    "comment",
+                    &policy.device_policy_id,
+                ],
+            ));
+            commands.push(CommandPlan::new(
+                "nft",
+                [
+                    "add",
+                    "rule",
+                    "inet",
+                    &self.nft_table,
+                    "forward",
+                    "ip",
+                    "saddr",
+                    cidr,
+                    "oifname",
+                    "!=",
+                    easytier_iface,
+                    "drop",
+                    "comment",
+                    &policy.device_policy_id,
+                ],
+            ));
+        }
+
+        if policy
+            .managed_cidrs
+            .iter()
+            .any(|cidr| cidr.trim() == "0.0.0.0/0")
+        {
+            for iface in &policy.ingress_ifaces {
+                commands.push(CommandPlan::new(
+                    "nft",
+                    [
+                        "add",
+                        "rule",
+                        "inet",
+                        &self.nft_table,
+                        "forward",
+                        "iifname",
+                        iface,
+                        "oifname",
+                        easytier_iface,
+                        "accept",
+                        "comment",
+                        &policy.device_policy_id,
+                    ],
+                ));
+                commands.push(CommandPlan::new(
+                    "nft",
+                    [
+                        "add",
+                        "rule",
+                        "inet",
+                        &self.nft_table,
+                        "forward",
+                        "iifname",
+                        iface,
+                        "oifname",
+                        "!=",
+                        easytier_iface,
+                        "drop",
+                        "comment",
+                        &policy.device_policy_id,
+                    ],
+                ));
+            }
         }
 
         if policy.include_device_traffic {
@@ -131,6 +257,9 @@ impl LinuxBackend {
 
     fn source_cleanup(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
         let mut commands = Vec::new();
+        for iface in &policy.ingress_ifaces {
+            commands.push(ingress_local_ip_rule_command(iface, self.table_id, "del"));
+        }
         for cidr in &policy.managed_cidrs {
             if cidr.trim() == "0.0.0.0/0" {
                 continue;
@@ -145,6 +274,18 @@ impl LinuxBackend {
                     ),
                 ],
             ));
+            for iface in &policy.ingress_ifaces {
+                commands.push(CommandPlan::new(
+                    "sh",
+                    [
+                        "-c",
+                        &format!(
+                            "ip rule del iif {iface} from {cidr} lookup {table} 2>/dev/null || true",
+                            table = self.table_id
+                        ),
+                    ],
+                ));
+            }
         }
         if policy.include_device_traffic {
             commands.push(CommandPlan::new(
@@ -172,6 +313,8 @@ impl LinuxBackend {
             ],
         ));
         commands
+            .push(self.delete_nft_rules_by_comment_command("forward", &policy.device_policy_id));
+        commands
     }
 
     fn exit_apply(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
@@ -189,6 +332,16 @@ impl LinuxBackend {
             self.ensure_nft_table_command(),
             CommandPlan::new("sh", ["-c", &postrouting_chain]),
             CommandPlan::new("sh", ["-c", &forward_chain]),
+            CommandPlan::new(
+                "sh",
+                [
+                    "-c",
+                    &format!(
+                        "ip rule del pref 100 iif {iface} lookup main 2>/dev/null || true; ip rule add pref 100 iif {iface} lookup main",
+                        iface = easytier_iface
+                    ),
+                ],
+            ),
             self.delete_nft_rules_by_comment_command("forward", &policy.device_policy_id),
             CommandPlan::new(
                 "nft",
@@ -268,6 +421,16 @@ impl LinuxBackend {
         vec![
             self.delete_nft_rules_by_comment_command("postrouting", &policy.device_policy_id),
             self.delete_nft_rules_by_comment_command("forward", &policy.device_policy_id),
+            CommandPlan::new(
+                "sh",
+                [
+                    "-c",
+                    &format!(
+                        "ip rule del pref 100 iif {iface} lookup main 2>/dev/null || true",
+                        iface = policy.easytier_iface
+                    ),
+                ],
+            ),
         ]
         .into_iter()
         .chain(
@@ -278,10 +441,7 @@ impl LinuxBackend {
                 .map(|cidr| {
                     CommandPlan::new(
                         "sh",
-                        [
-                            "-c",
-                            &format!("ip route del {cidr} 2>/dev/null || true"),
-                        ],
+                        ["-c", &format!("ip route del {cidr} 2>/dev/null || true")],
                     )
                 }),
         )
@@ -297,6 +457,24 @@ impl LinuxBackend {
         )))
         .collect()
     }
+}
+
+fn ingress_local_ip_rule_command(iface: &str, table_id: u32, action: &str) -> CommandPlan {
+    let iface = shell_single_quote(iface);
+    let script = format!(
+        "ip -4 -o addr show dev {iface} | awk '{{print $4}}' | while read -r cidr; do \
+[ -n \"$cidr\" ] || continue; \
+ip rule {action} pref 100 from \"$cidr\" lookup {table} 2>/dev/null || true; \
+done",
+        iface = iface,
+        action = action,
+        table = table_id,
+    );
+    CommandPlan::new("sh", ["-c", &script])
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 impl PlatformBackend for LinuxBackend {
@@ -377,9 +555,30 @@ mod tests {
                 && cmd.contains("ip rule add from 192.168.10.0/24 lookup 126")
         }));
         assert!(shell_commands.iter().any(|cmd| {
+            cmd.contains("ip -4 -o addr show dev 'br-lan'")
+                && cmd.contains("ip rule add pref 100 from \"$cidr\" lookup 126")
+        }));
+        assert!(shell_commands.iter().any(|cmd| {
             cmd.contains("ip rule del fwmark 0x7e lookup 126 2>/dev/null || true")
                 && cmd.contains("ip rule add fwmark 0x7e lookup 126")
         }));
+    }
+
+    #[test]
+    fn source_apply_adds_blackhole_and_forward_kill_switch() {
+        let backend = LinuxBackend::default();
+        let commands = backend
+            .plan_apply(&policy(DevicePolicyRole::ClientGatewayViaPeer))
+            .unwrap();
+        let command_text = commands
+            .iter()
+            .map(|cmd| format!("{} {}", cmd.program, cmd.args.join(" ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(command_text.contains("ip route replace blackhole default table 126 metric 32767"));
+        assert!(command_text.contains("nft add rule inet easytier_agent forward ip saddr 192.168.10.0/24 oifname easytier0 accept comment p1/source"));
+        assert!(command_text.contains("nft add rule inet easytier_agent forward ip saddr 192.168.10.0/24 oifname != easytier0 drop comment p1/source"));
     }
 
     #[test]
@@ -394,6 +593,17 @@ mod tests {
                     .args
                     .join(" ")
                     .contains("ip rule del from 192.168.10.0/24 lookup 126 2>/dev/null || true")
+        }));
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "sh"
+                && cmd
+                    .args
+                    .join(" ")
+                    .contains("ip -4 -o addr show dev 'br-lan'")
+                && cmd
+                    .args
+                    .join(" ")
+                    .contains("ip rule del pref 100 from \"$cidr\" lookup 126")
         }));
         assert!(commands.iter().any(|cmd| {
             cmd.program == "sh"
@@ -421,6 +631,13 @@ mod tests {
         assert!(commands.iter().any(|cmd| cmd.program == "sysctl"));
         assert!(commands.iter().any(|cmd| {
             cmd.program == "nft" && cmd.args.contains(&"192.168.10.0/24".to_string())
+        }));
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "sh"
+                && cmd
+                    .args
+                    .join(" ")
+                    .contains("ip rule add pref 100 iif easytier0 lookup main")
         }));
     }
 
@@ -566,6 +783,13 @@ mod tests {
                     .join(" ")
                     .contains("ip route del 192.168.10.0/24 2>/dev/null || true")
         }));
+        assert!(commands.iter().any(|command| {
+            command.program == "sh"
+                && command
+                    .args
+                    .join(" ")
+                    .contains("ip rule del pref 100 iif easytier0 lookup main")
+        }));
         assert!(
             commands
                 .iter()
@@ -590,7 +814,9 @@ mod tests {
             commands[0]
                 .args
                 .iter()
-                .any(|arg| arg.contains("nft -a list chain"))
+                .any(|arg| arg.contains("nft -a list chain")
+                    && arg.contains("index($0, c)")
+                    && !arg.contains(r#"comment \\\""#))
         );
         assert!(commands[0].args.iter().any(|arg| arg.contains("handle")));
         assert!(commands[0].args.contains(&"p1/source".to_string()));

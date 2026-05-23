@@ -8,15 +8,16 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use easytier_agent::{
-    AgentApiAuth, AgentRuntimeReport, CommandExecutionMode, CommandPlan, ControlPlaneEndpoint,
-    ControlPlaneGuard, DevicePolicy, PlatformBackend, PolicyReconciler, ReportTarget,
-    SystemCommandExecutor, apply_command_plan, build_idle_runtime_report, build_runtime_report,
-    build_runtime_report_from_failure, derive_policy_status_for_policy, dry_run_plan,
-    enroll_and_store_agent, fetch_device_policies, platform::linux::LinuxBackend,
+    AgentApiAuth, AgentRuntimeObservation, AgentRuntimeReport, CommandExecutionMode, CommandPlan,
+    ControlPlaneEndpoint, ControlPlaneGuard, DevicePolicy, PlatformBackend, PolicyReconciler,
+    ReportTarget, SystemCommandExecutor, apply_command_plan, build_idle_runtime_report,
+    build_runtime_report, build_runtime_report_from_failure, derive_policy_status_for_policy,
+    dry_run_plan, enroll_and_store_agent, fetch_device_policies, platform::linux::LinuxBackend,
     platform::openwrt::OpenWrtBackend, post_runtime_report, rotate_and_confirm_credential,
 };
 
 const DEFAULT_REAPPLY_INTERVAL: Duration = Duration::from_secs(60);
+const EASYTIER_IFACE_CANDIDATES: [&str; 2] = ["easytierw0", "easytier0"];
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -126,6 +127,7 @@ enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum PlatformKind {
     Linux,
+    #[value(alias = "istoreos")]
     OpenWrt,
 }
 
@@ -194,6 +196,24 @@ mod tests {
             "/tmp/policy.json",
             "--platform",
             "open-wrt",
+        ]);
+
+        let Command::Apply { platform, .. } = cli.command else {
+            panic!("expected apply command");
+        };
+
+        assert_eq!(platform, PlatformKind::OpenWrt);
+    }
+
+    #[test]
+    fn apply_accepts_istoreos_platform_alias() {
+        let cli = Cli::parse_from([
+            "easytier-agent",
+            "apply",
+            "--policy",
+            "/tmp/policy.json",
+            "--platform",
+            "istoreos",
         ]);
 
         let Command::Apply { platform, .. } = cli.command else {
@@ -320,7 +340,11 @@ mod tests {
                     .join(" ")
                     .contains("ip rule del from 192.168.10.0/24 lookup 126 2>/dev/null || true")
         }));
-        assert!(!commands.iter().any(|cmd| cmd.program == "fw4" && cmd.args == ["reload"]));
+        assert!(
+            !commands
+                .iter()
+                .any(|cmd| cmd.program == "fw4" && cmd.args == ["reload"])
+        );
     }
 
     #[test]
@@ -491,11 +515,73 @@ mod tests {
     #[test]
     fn explicit_easytier_ipv4_wins_over_interface_detection() {
         assert_eq!(
-            super::resolve_easytier_ipv4(
-                Some("10.126.126.9".to_string()),
-                Some("easytierw0")
-            ),
+            super::resolve_easytier_ipv4(Some("10.126.126.9".to_string()), Some("easytierw0")),
             Some("10.126.126.9".to_string())
+        );
+    }
+
+    #[test]
+    fn web_client_interface_is_preferred_when_auto_detecting_easytier_iface() {
+        assert_eq!(super::EASYTIER_IFACE_CANDIDATES[0], "easytierw0");
+        assert_eq!(super::EASYTIER_IFACE_CANDIDATES[1], "easytier0");
+    }
+
+    #[test]
+    fn disabled_device_policies_are_ordered_before_enabled_policies() {
+        let make_policy = |enabled: bool, device_policy_id: &str| -> easytier_agent::DevicePolicy {
+            serde_json::from_str(&format!(
+                r#"{{
+                  "policy_id": "p1",
+                  "device_policy_id": "{device_policy_id}",
+                  "enabled": {enabled},
+                  "version": 1,
+                  "role": "client_gateway_via_peer",
+                  "network_instance_id": "{}",
+                  "source_machine_id": "node-a",
+                  "managed_cidrs": ["192.168.10.0/24"],
+                  "ingress_ifaces": ["br-lan"],
+                  "include_device_traffic": true,
+                  "exit_machine_id": "node-b",
+                  "exit_peer_ipv4": "10.126.126.3",
+                  "protect_control_plane": true,
+                  "rollback_enabled": true
+                }}"#,
+                uuid::Uuid::nil()
+            ))
+            .unwrap()
+        };
+        let mut disabled = make_policy(false, "disabled");
+        disabled.enabled = false;
+        let mut enabled = make_policy(true, "enabled");
+        enabled.enabled = true;
+
+        let policies = super::ordered_device_policies(vec![enabled, disabled]);
+
+        assert_eq!(policies[0].device_policy_id, "disabled");
+        assert_eq!(policies[1].device_policy_id, "enabled");
+    }
+
+    #[test]
+    fn parses_ipv4_cidrs_from_ip_addr_output() {
+        let output = "\
+2: br-lan    inet 192.168.20.1/24 brd 192.168.20.255 scope global br-lan\n\
+2: br-lan    inet 10.10.0.1/16 scope global secondary br-lan\n";
+
+        assert_eq!(
+            super::parse_ipv4_cidrs_from_ip_addr_output(output),
+            vec!["192.168.20.1/24", "10.10.0.1/16"]
+        );
+    }
+
+    #[test]
+    fn parses_first_default_route_line() {
+        let output = "\
+default via 192.168.64.1 dev eth0 proto dhcp src 192.168.64.9\n\
+192.168.64.0/24 dev eth0 proto kernel scope link src 192.168.64.9\n";
+
+        assert_eq!(
+            super::parse_default_route_output(output).as_deref(),
+            Some("default via 192.168.64.1 dev eth0 proto dhcp src 192.168.64.9")
         );
     }
 }
@@ -532,7 +618,16 @@ fn main() -> anyhow::Result<()> {
                 credential_file,
                 machine_id.clone(),
             )?;
-            let report = run_command_plan(machine_id, easytier_ipv4, &policy, commands, execute);
+            let observation =
+                detect_runtime_observation(platform, Some(policy.easytier_iface.as_str()));
+            let report = run_command_plan(
+                machine_id,
+                easytier_ipv4,
+                &policy,
+                commands,
+                execute,
+                observation,
+            );
             if let Some(target) = report_target {
                 post_runtime_report(&target, &report)?;
             }
@@ -560,7 +655,16 @@ fn main() -> anyhow::Result<()> {
                 credential_file,
                 machine_id.clone(),
             )?;
-            let report = run_command_plan(machine_id, easytier_ipv4, &policy, commands, execute);
+            let observation =
+                detect_runtime_observation(platform, Some(policy.easytier_iface.as_str()));
+            let report = run_command_plan(
+                machine_id,
+                easytier_ipv4,
+                &policy,
+                commands,
+                execute,
+                observation,
+            );
             if let Some(target) = report_target {
                 post_runtime_report(&target, &report)?;
             }
@@ -724,11 +828,15 @@ fn run_reconcile_iteration(
     reconciler: &mut PolicyReconciler,
 ) -> anyhow::Result<()> {
     let policies = fetch_device_policies(target)?;
+    let policies = ordered_device_policies(policies);
     let observed_easytier_ipv4 =
         resolve_easytier_ipv4(easytier_ipv4.clone(), easytier_iface.as_deref());
     if policies.is_empty() {
-        let report =
-            build_idle_runtime_report(target.machine_id.clone(), observed_easytier_ipv4);
+        let report = build_idle_runtime_report(target.machine_id.clone(), observed_easytier_ipv4)
+            .with_observation(detect_runtime_observation(
+                platform,
+                easytier_iface.as_deref(),
+            ));
         post_runtime_report(target, &report)?;
         println!("{}", serde_json::to_string(&report)?);
         return Ok(());
@@ -744,17 +852,17 @@ fn run_reconcile_iteration(
             "reconcile: {:?}",
             easytier_agent::ReconcileEvent::Apply(policy.device_policy_id.clone(), policy.version)
         );
-        let commands = commands_for_reported_policy(
-            &policy,
-            Some(target.web_base_url.clone()),
-            platform,
-        )?;
+        let commands =
+            commands_for_reported_policy(&policy, Some(target.web_base_url.clone()), platform)?;
+        let observation =
+            detect_runtime_observation(platform, Some(policy.easytier_iface.as_str()));
         let report = run_command_plan(
             target.machine_id.clone(),
             observed_easytier_ipv4.clone(),
             &policy,
             commands,
             execute,
+            observation,
         );
         post_runtime_report(target, &report)?;
         println!("{}", serde_json::to_string(&report)?);
@@ -769,11 +877,15 @@ fn run_once(
     easytier_iface: Option<String>,
     execute: bool,
 ) -> anyhow::Result<()> {
-    let mut policies = fetch_device_policies(&target)?;
+    let mut policies = ordered_device_policies(fetch_device_policies(&target)?);
     let observed_easytier_ipv4 =
         resolve_easytier_ipv4(easytier_ipv4.clone(), easytier_iface.as_deref());
     if policies.is_empty() {
-        let report = build_idle_runtime_report(target.machine_id.clone(), observed_easytier_ipv4);
+        let report = build_idle_runtime_report(target.machine_id.clone(), observed_easytier_ipv4)
+            .with_observation(detect_runtime_observation(
+                platform,
+                easytier_iface.as_deref(),
+            ));
         post_runtime_report(&target, &report)?;
         println!("{}", serde_json::to_string(&report)?);
         return Ok(());
@@ -786,17 +898,17 @@ fn run_once(
         println!("reconcile: {event:?}");
     }
     for policy in policies {
-        let commands = commands_for_reported_policy(
-            &policy,
-            Some(target.web_base_url.clone()),
-            platform,
-        )?;
+        let commands =
+            commands_for_reported_policy(&policy, Some(target.web_base_url.clone()), platform)?;
+        let observation =
+            detect_runtime_observation(platform, Some(policy.easytier_iface.as_str()));
         let report = run_command_plan(
             target.machine_id.clone(),
             observed_easytier_ipv4.clone(),
             &policy,
             commands,
             execute,
+            observation,
         );
         post_runtime_report(&target, &report)?;
         println!("{}", serde_json::to_string(&report)?);
@@ -807,6 +919,11 @@ fn run_once(
 fn read_policy(path: PathBuf) -> anyhow::Result<DevicePolicy> {
     let raw = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&raw)?)
+}
+
+fn ordered_device_policies(mut policies: Vec<DevicePolicy>) -> Vec<DevicePolicy> {
+    policies.sort_by_key(|policy| policy.enabled);
+    policies
 }
 
 fn resolve_easytier_ipv4(
@@ -833,20 +950,97 @@ fn detect_iface_ipv4(iface: &str) -> Option<String> {
     parse_ipv4_from_ip_addr_output(std::str::from_utf8(&output.stdout).ok()?)
 }
 
-fn parse_ipv4_from_ip_addr_output(output: &str) -> Option<String> {
-    output.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        while let Some(part) = parts.next() {
-            if part == "inet" {
-                return parts
-                    .next()
-                    .and_then(|cidr| cidr.split('/').next())
-                    .filter(|ip| !ip.trim().is_empty())
-                    .map(str::to_string);
-            }
+fn detect_runtime_observation(
+    platform: PlatformKind,
+    easytier_iface: Option<&str>,
+) -> AgentRuntimeObservation {
+    let (ingress_ifaces, lan_cidrs) = detect_lan_observation();
+    AgentRuntimeObservation {
+        easytier_iface: easytier_iface
+            .filter(|iface| !iface.trim().is_empty())
+            .map(str::to_string)
+            .or_else(detect_easytier_iface),
+        lan_cidrs,
+        ingress_ifaces,
+        default_route: detect_default_route(),
+        firewall_backend: Some(platform.firewall_backend().to_string()),
+        protected_routes: Vec::new(),
+    }
+}
+
+fn detect_lan_observation() -> (Vec<String>, Vec<String>) {
+    for iface in ["br-lan", "lan", "eth1"] {
+        let cidrs = detect_iface_ipv4_cidrs(iface);
+        if !cidrs.is_empty() {
+            return (vec![iface.to_string()], cidrs);
         }
-        None
+    }
+    (Vec::new(), Vec::new())
+}
+
+fn detect_iface_ipv4_cidrs(iface: &str) -> Vec<String> {
+    let output = match ProcessCommand::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", iface])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    parse_ipv4_cidrs_from_ip_addr_output(std::str::from_utf8(&output.stdout).unwrap_or_default())
+}
+
+fn detect_default_route() -> Option<String> {
+    let output = ProcessCommand::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_default_route_output(std::str::from_utf8(&output.stdout).ok()?)
+}
+
+fn detect_easytier_iface() -> Option<String> {
+    EASYTIER_IFACE_CANDIDATES.into_iter().find_map(|iface| {
+        ProcessCommand::new("ip")
+            .args(["link", "show", "dev", iface])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|_| iface.to_string())
     })
+}
+
+fn parse_ipv4_cidrs_from_ip_addr_output(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            while let Some(part) = parts.next() {
+                if part == "inet" {
+                    return parts
+                        .next()
+                        .filter(|cidr| !cidr.trim().is_empty())
+                        .map(str::to_string);
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+fn parse_ipv4_from_ip_addr_output(output: &str) -> Option<String> {
+    parse_ipv4_cidrs_from_ip_addr_output(output)
+        .into_iter()
+        .find_map(|cidr| cidr.split('/').next().map(str::to_string))
+}
+
+fn parse_default_route_output(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("default "))
+        .map(str::to_string)
 }
 
 fn apply_easytier_iface_override(policy: &mut DevicePolicy, easytier_iface: Option<String>) {
@@ -1044,6 +1238,7 @@ fn run_command_plan(
     policy: &DevicePolicy,
     commands: Vec<easytier_agent::CommandPlan>,
     execute: bool,
+    observation: AgentRuntimeObservation,
 ) -> AgentRuntimeReport {
     let mode = if execute {
         CommandExecutionMode::Execute
@@ -1070,6 +1265,7 @@ fn run_command_plan(
                 &command_report,
                 None,
             )
+            .with_observation(observation)
         }
         Err(failure) => {
             for command in &failure.report.commands {
@@ -1077,6 +1273,16 @@ fn run_command_plan(
             }
             println!("executed_count: {}", failure.report.executed_count);
             build_runtime_report_from_failure(machine_id, easytier_ipv4, policy, &failure)
+                .with_observation(observation)
+        }
+    }
+}
+
+impl PlatformKind {
+    fn firewall_backend(self) -> &'static str {
+        match self {
+            PlatformKind::Linux => "nftables",
+            PlatformKind::OpenWrt => "fw4-nftables",
         }
     }
 }
