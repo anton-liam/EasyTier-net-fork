@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::DevicePolicy;
+use crate::{DevicePolicy, PolicyStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconcileEvent {
@@ -15,6 +15,7 @@ struct ObservedPolicy {
     version: u64,
     enabled: bool,
     applied_at: Instant,
+    last_status: Option<PolicyStatus>,
 }
 
 #[derive(Debug, Default)]
@@ -54,19 +55,38 @@ impl PolicyReconciler {
                 reapply_interval
                     .is_some_and(|interval| now.duration_since(observed.applied_at) >= interval)
             });
-            if version_changed || enabled_changed || reapply_due {
+            let retry_due = observed.is_some_and(|observed| {
+                matches!(
+                    observed.last_status,
+                    Some(PolicyStatus::Degraded | PolicyStatus::Rollbacked)
+                )
+            });
+            if version_changed || enabled_changed || reapply_due || retry_due {
                 self.observed_versions.insert(
                     policy.device_policy_id.clone(),
                     ObservedPolicy {
                         version: policy.version,
                         enabled: policy.enabled,
                         applied_at: now,
+                        last_status: observed.and_then(|observed| observed.last_status),
                     },
                 );
                 policies_to_apply.push(policy.clone());
             }
         }
         Ok(policies_to_apply)
+    }
+
+    pub fn record_policy_status(
+        &mut self,
+        device_policy_id: &str,
+        status: PolicyStatus,
+        now: Instant,
+    ) {
+        if let Some(observed) = self.observed_versions.get_mut(device_policy_id) {
+            observed.applied_at = now;
+            observed.last_status = Some(status);
+        }
     }
 
     pub fn observed_version(&self, device_policy_id: &str) -> Option<u64> {
@@ -82,7 +102,9 @@ mod tests {
 
     use uuid::Uuid;
 
-    use crate::{DevicePolicy, DevicePolicyRole, ExitEgress, PolicyReconciler, ReconcileEvent};
+    use crate::{
+        DevicePolicy, DevicePolicyRole, ExitEgress, PolicyReconciler, PolicyStatus, ReconcileEvent,
+    };
 
     fn policy(device_policy_id: &str, version: u64) -> DevicePolicy {
         DevicePolicy {
@@ -202,5 +224,62 @@ mod tests {
                 .unwrap(),
             vec![policy]
         );
+    }
+
+    #[test]
+    fn policies_to_apply_retries_degraded_policy_immediately() {
+        let mut reconciler = PolicyReconciler::default();
+        let policy = policy("p1/source", 1);
+        let started_at = Instant::now();
+
+        assert_eq!(
+            reconciler
+                .policies_to_apply_at(&[policy.clone()], started_at, Some(Duration::from_secs(60)))
+                .unwrap(),
+            vec![policy.clone()]
+        );
+        reconciler.record_policy_status(
+            "p1/source",
+            crate::PolicyStatus::Degraded,
+            started_at + Duration::from_secs(1),
+        );
+
+        assert_eq!(
+            reconciler
+                .policies_to_apply_at(
+                    &[policy.clone()],
+                    started_at + Duration::from_secs(2),
+                    Some(Duration::from_secs(60))
+                )
+                .unwrap(),
+            vec![policy]
+        );
+    }
+
+    #[test]
+    fn reconcile_retries_degraded_policy_without_waiting_for_interval() {
+        let mut reconciler = PolicyReconciler::default();
+        let policy = policy("p1/source", 1);
+        let started_at = Instant::now();
+
+        let first = reconciler
+            .policies_to_apply_at(&[policy.clone()], started_at, Some(Duration::from_secs(60)))
+            .unwrap();
+        assert_eq!(first, vec![policy.clone()]);
+
+        reconciler.record_policy_status(
+            "p1/source",
+            PolicyStatus::Degraded,
+            started_at + Duration::from_secs(1),
+        );
+
+        let second = reconciler
+            .policies_to_apply_at(
+                &[policy.clone()],
+                started_at + Duration::from_secs(2),
+                Some(Duration::from_secs(60)),
+            )
+            .unwrap();
+        assert_eq!(second, vec![policy]);
     }
 }

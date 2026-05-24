@@ -88,13 +88,18 @@ impl LinuxBackend {
             ),
         ];
 
+        for iface in &policy.ingress_ifaces {
+            commands.push(ingress_local_ip_rule_command(iface, self.table_id));
+            commands.push(ingress_local_direct_route_command(iface));
+        }
+
         for cidr in &policy.managed_cidrs {
             commands.push(CommandPlan::new(
                 "sh",
                 [
                     "-c",
                     &format!(
-                        "ip rule del from {cidr} lookup {table} 2>/dev/null || true; ip rule add from {cidr} lookup {table}",
+                        "while ip rule del from {cidr} lookup {table} 2>/dev/null; do :; done; ip rule add pref 100 from {cidr} lookup {table}",
                         table = self.table_id
                     ),
                 ],
@@ -105,16 +110,12 @@ impl LinuxBackend {
                     [
                         "-c",
                         &format!(
-                            "ip rule del iif {iface} from {cidr} lookup {table} 2>/dev/null || true; ip rule add iif {iface} from {cidr} lookup {table}",
+                            "while ip rule del iif {iface} from {cidr} lookup {table} 2>/dev/null; do :; done; ip rule add pref 100 iif {iface} from {cidr} lookup {table}",
                             table = self.table_id
                         ),
                     ],
                 ));
             }
-        }
-
-        for iface in &policy.ingress_ifaces {
-            commands.push(ingress_local_ip_rule_command(iface, self.table_id, "add"));
         }
 
         let nft_table = &self.nft_table;
@@ -258,7 +259,8 @@ impl LinuxBackend {
     fn source_cleanup(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
         let mut commands = Vec::new();
         for iface in &policy.ingress_ifaces {
-            commands.push(ingress_local_ip_rule_command(iface, self.table_id, "del"));
+            commands.push(ingress_local_ip_rule_command(iface, self.table_id));
+            commands.push(ingress_local_direct_cleanup_command(iface));
         }
         for cidr in &policy.managed_cidrs {
             if cidr.trim() == "0.0.0.0/0" {
@@ -459,16 +461,40 @@ impl LinuxBackend {
     }
 }
 
-fn ingress_local_ip_rule_command(iface: &str, table_id: u32, action: &str) -> CommandPlan {
+fn ingress_local_ip_rule_command(iface: &str, table_id: u32) -> CommandPlan {
     let iface = shell_single_quote(iface);
     let script = format!(
         "ip -4 -o addr show dev {iface} | awk '{{print $4}}' | while read -r cidr; do \
 [ -n \"$cidr\" ] || continue; \
-ip rule {action} pref 100 from \"$cidr\" lookup {table} 2>/dev/null || true; \
+while ip rule del from \"$cidr\" lookup {table} 2>/dev/null; do :; done; \
 done",
         iface = iface,
-        action = action,
         table = table_id,
+    );
+    CommandPlan::new("sh", ["-c", &script])
+}
+
+fn ingress_local_direct_route_command(iface: &str) -> CommandPlan {
+    let iface = shell_single_quote(iface);
+    let script = format!(
+        "ip -4 -o addr show dev {iface} | awk '{{print $4}}' | while read -r cidr; do \
+[ -n \"$cidr\" ] || continue; \
+while ip rule del to \"$cidr\" lookup main 2>/dev/null; do :; done; \
+ip rule add pref 90 to \"$cidr\" lookup main; \
+done",
+        iface = iface,
+    );
+    CommandPlan::new("sh", ["-c", &script])
+}
+
+fn ingress_local_direct_cleanup_command(iface: &str) -> CommandPlan {
+    let iface = shell_single_quote(iface);
+    let script = format!(
+        "ip -4 -o addr show dev {iface} | awk '{{print $4}}' | while read -r cidr; do \
+[ -n \"$cidr\" ] || continue; \
+while ip rule del to \"$cidr\" lookup main 2>/dev/null; do :; done; \
+done",
+        iface = iface,
     );
     CommandPlan::new("sh", ["-c", &script])
 }
@@ -551,10 +577,14 @@ mod tests {
             .map(|cmd| cmd.args.join(" "))
             .collect::<Vec<_>>();
         assert!(shell_commands.iter().any(|cmd| {
-            cmd.contains("ip rule del from 192.168.10.0/24 lookup 126 2>/dev/null || true")
-                && cmd.contains("ip rule add from 192.168.10.0/24 lookup 126")
+            cmd.contains("while ip rule del from 192.168.10.0/24 lookup 126")
+                && cmd.contains("ip rule add pref 100 from 192.168.10.0/24 lookup 126")
         }));
         assert!(shell_commands.iter().any(|cmd| {
+            cmd.contains("ip -4 -o addr show dev 'br-lan'")
+                && cmd.contains("while ip rule del from \"$cidr\" lookup 126")
+        }));
+        assert!(!shell_commands.iter().any(|cmd| {
             cmd.contains("ip -4 -o addr show dev 'br-lan'")
                 && cmd.contains("ip rule add pref 100 from \"$cidr\" lookup 126")
         }));
@@ -582,6 +612,72 @@ mod tests {
     }
 
     #[test]
+    fn source_apply_does_not_route_ingress_local_addresses_when_managed_cidrs_are_explicit() {
+        let backend = LinuxBackend::default();
+        let mut policy = policy(DevicePolicyRole::ClientGatewayViaPeer);
+        policy.include_device_traffic = false;
+        policy.managed_cidrs = vec!["192.168.100.0/24".to_string()];
+        policy.ingress_ifaces = vec!["br-lan".to_string()];
+
+        let commands = backend.plan_apply(&policy).unwrap();
+        let command_text = commands
+            .iter()
+            .map(|cmd| format!("{} {}", cmd.program, cmd.args.join(" ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            command_text.contains("while ip rule del from 192.168.100.0/24 lookup 126"),
+            "apply must clean stale ingress-local rules left by older agents: {command_text}"
+        );
+        assert!(
+            !command_text.contains("ip rule add from 192.168.100.0/24 lookup 126"),
+            "source management subnet must not be auto-routed when managed_cidrs explicitly target client subnets: {command_text}"
+        );
+        assert!(
+            command_text.contains(
+                "while ip rule del from 192.168.100.0/24 lookup 126"
+            ),
+            "managed CIDR rules must be removed before adding to keep apply idempotent: {command_text}"
+        );
+        assert!(
+            command_text.contains("ip rule add pref 100 from 192.168.100.0/24 lookup 126"),
+            "managed CIDR rule must use stable priority so cleanup can remove all stale copies: {command_text}"
+        );
+        assert!(
+            command_text.contains("ip rule add pref 90 to \"$cidr\" lookup main"),
+            "local-direct destinations on ingress interfaces must stay on the main table: {command_text}"
+        );
+    }
+
+    #[test]
+    fn source_apply_protects_local_direct_routes_before_managed_routes() {
+        let backend = LinuxBackend::default();
+        let mut policy = policy(DevicePolicyRole::ClientGatewayViaPeer);
+        policy.include_device_traffic = false;
+        policy.managed_cidrs = vec!["192.168.100.0/24".to_string()];
+        policy.ingress_ifaces = vec!["br-lan".to_string()];
+
+        let commands = backend.plan_apply(&policy).unwrap();
+        let command_text = commands
+            .iter()
+            .map(|cmd| format!("{} {}", cmd.program, cmd.args.join(" ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let local_direct = command_text
+            .find("ip rule add pref 90 to \"$cidr\" lookup main")
+            .expect("expected local-direct protection command");
+        let managed_route = command_text
+            .find("ip rule add pref 100 from 192.168.100.0/24 lookup 126")
+            .expect("expected managed route command");
+
+        assert!(
+            local_direct < managed_route,
+            "local-direct protection must be installed before managed routes: {command_text}"
+        );
+    }
+
+    #[test]
     fn source_cleanup_only_targets_this_policy_shape() {
         let backend = LinuxBackend::default();
         let commands = backend
@@ -600,10 +696,15 @@ mod tests {
                     .args
                     .join(" ")
                     .contains("ip -4 -o addr show dev 'br-lan'")
+                && cmd.args.join(" ").contains("while ip rule del from \"$cidr\" lookup 126")
+        }));
+        assert!(commands.iter().any(|cmd| {
+            cmd.program == "sh"
                 && cmd
                     .args
                     .join(" ")
-                    .contains("ip rule del pref 100 from \"$cidr\" lookup 126")
+                    .contains("ip -4 -o addr show dev 'br-lan'")
+                && cmd.args.join(" ").contains("while ip rule del to \"$cidr\" lookup main")
         }));
         assert!(commands.iter().any(|cmd| {
             cmd.program == "sh"

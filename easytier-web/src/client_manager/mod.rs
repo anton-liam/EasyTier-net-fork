@@ -36,7 +36,7 @@ use tokio::task::JoinSet;
 
 use crate::db::{Db, UserIdInDb, entity::user_running_network_configs};
 
-const DEFAULT_GATEWAY_PEER_URL: &str = "udp://137.220.194.19:22020/admin";
+const DEFAULT_GATEWAY_PEER_URL: &str = "udp://137.220.194.19:11010";
 const GATEWAY_DEFAULT_PEER_URLS_ENV: &str = "EASYTIER_GATEWAY_DEFAULT_PEER_URLS";
 
 #[derive(Debug, Clone)]

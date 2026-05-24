@@ -332,7 +332,7 @@ mod tests {
             current_token: "current-token".to_string(),
             next_token: Some("next-token".to_string()),
             next_token_status: Some("pending_confirm".to_string()),
-            api_base_url: Some("http://10.126.126.1:11212".to_string()),
+            api_base_url: Some("http://10.126.126.1:11211".to_string()),
             updated_at: "2026-05-20T10:00:00Z".to_string(),
         };
 

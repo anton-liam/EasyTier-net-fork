@@ -718,7 +718,7 @@ mod tests {
     #[tokio::test]
     async fn enroll_agent_returns_configured_overlay_api_base_url() {
         let (base_url, _db, client_mgr, user_id, _server) =
-            test_server_with_agent_api_base_url(Some("http://10.126.126.1:11212".to_string()))
+            test_server_with_agent_api_base_url(Some("http://10.126.126.1:11211".to_string()))
                 .await;
         let machine_id = uuid::Uuid::new_v4();
         client_mgr.storage_for_tests().update_client(
@@ -753,7 +753,7 @@ mod tests {
         let body = response.json::<EnrollAgentResponse>().await.unwrap();
         assert_eq!(
             body.api_base_url.as_deref(),
-            Some("http://10.126.126.1:11212")
+            Some("http://10.126.126.1:11211")
         );
     }
 

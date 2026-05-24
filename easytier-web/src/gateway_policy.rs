@@ -38,6 +38,8 @@ pub struct QuickApplyGatewayPolicyRequest {
     #[serde(default)]
     pub managed_cidrs_mode: ManagedCidrsMode,
     #[serde(default)]
+    pub managed_cidrs: Vec<String>,
+    #[serde(default)]
     pub include_device_traffic: bool,
 }
 
@@ -791,8 +793,12 @@ pub fn build_quick_apply_gateway_policy_for_network(
         return Err(PolicyError::AgentReportStale(exit.machine_id));
     }
 
-    let managed_cidrs = match request.managed_cidrs_mode {
-        ManagedCidrsMode::Auto => source.agent.lan_cidrs.clone(),
+    let managed_cidrs = if request.managed_cidrs.is_empty() {
+        match request.managed_cidrs_mode {
+            ManagedCidrsMode::Auto => source.agent.lan_cidrs.clone(),
+        }
+    } else {
+        request.managed_cidrs.clone()
     };
     if managed_cidrs.is_empty() {
         return Err(PolicyError::MissingManagedCidrs);
@@ -919,7 +925,7 @@ fn default_true() -> bool {
 }
 
 fn default_easytier_iface() -> String {
-    "easytierw0".to_string()
+    "tun0".to_string()
 }
 
 #[cfg(test)]
@@ -945,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn device_policy_defaults_to_easytierw0() {
+    fn device_policy_defaults_to_tun0() {
         let policy: DevicePolicy = serde_json::from_str(&format!(
             r#"{{
               "policy_id": "{}",
@@ -972,7 +978,7 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(policy.easytier_iface, "easytierw0");
+        assert_eq!(policy.easytier_iface, "tun0");
     }
 
     #[test]
@@ -1263,6 +1269,7 @@ mod tests {
             exit_machine_id: machine,
             network_instance_id: None,
             managed_cidrs_mode: ManagedCidrsMode::Auto,
+            managed_cidrs: vec![],
             include_device_traffic: false,
         };
 
@@ -1282,6 +1289,7 @@ mod tests {
             exit_machine_id: exit,
             network_instance_id: None,
             managed_cidrs_mode: ManagedCidrsMode::Auto,
+            managed_cidrs: vec![],
             include_device_traffic: false,
         };
         let nodes = vec![
@@ -1306,6 +1314,7 @@ mod tests {
             exit_machine_id: exit,
             network_instance_id: None,
             managed_cidrs_mode: ManagedCidrsMode::Auto,
+            managed_cidrs: vec![],
             include_device_traffic: false,
         };
         let nodes = vec![
@@ -1327,6 +1336,31 @@ mod tests {
     }
 
     #[test]
+    fn quick_apply_prefers_explicit_managed_cidrs_override() {
+        let source = Uuid::new_v4();
+        let exit = Uuid::new_v4();
+        let network = Uuid::new_v4();
+        let policy_id = Uuid::new_v4();
+        let request = QuickApplyGatewayPolicyRequest {
+            source_machine_id: source,
+            exit_machine_id: exit,
+            network_instance_id: None,
+            managed_cidrs_mode: ManagedCidrsMode::Auto,
+            managed_cidrs: vec!["192.168.100.0/24".to_string()],
+            include_device_traffic: false,
+        };
+        let nodes = vec![
+            gateway_node_view(source, network, true, vec!["192.168.64.2/24"]),
+            gateway_node_view(exit, network, true, vec!["192.168.64.3/24"]),
+        ];
+
+        let policy = build_quick_apply_gateway_policy(&request, &nodes, policy_id, 11).unwrap();
+
+        assert_eq!(policy.managed_cidrs, vec!["192.168.100.0/24"]);
+        assert_eq!(policy.ingress_ifaces, vec!["br-lan"]);
+    }
+
+    #[test]
     fn quick_apply_can_build_policy_for_prepared_gateway_default_network() {
         let source = Uuid::new_v4();
         let exit = Uuid::new_v4();
@@ -1337,6 +1371,7 @@ mod tests {
             exit_machine_id: exit,
             network_instance_id: None,
             managed_cidrs_mode: ManagedCidrsMode::Auto,
+            managed_cidrs: vec![],
             include_device_traffic: false,
         };
         let mut source_node =
@@ -1371,7 +1406,7 @@ mod tests {
             network_id,
             "secret-1".to_string(),
             Some("r3s-a".to_string()),
-            vec!["udp://137.220.194.19:22020/admin".to_string()],
+            vec!["udp://137.220.194.19:11010".to_string()],
         );
 
         assert_eq!(
@@ -1384,7 +1419,7 @@ mod tests {
         );
         assert_eq!(config.network_secret.as_deref(), Some("secret-1"));
         assert_eq!(config.hostname.as_deref(), Some("r3s-a"));
-        assert_eq!(config.peer_urls, vec!["udp://137.220.194.19:22020/admin"]);
+        assert_eq!(config.peer_urls, vec!["udp://137.220.194.19:11010"]);
         assert_eq!(
             config.networking_method,
             Some(easytier::launcher::NetworkingMethod::Manual as i32)

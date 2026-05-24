@@ -163,7 +163,7 @@ fn default_true() -> bool {
 }
 
 pub fn default_easytier_iface() -> String {
-    "easytierw0".to_string()
+    "tun0".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -219,7 +219,7 @@ mod tests {
         assert_eq!(policy.role, DevicePolicyRole::ClientGatewayViaPeer);
         assert_eq!(policy.managed_cidrs, vec!["192.168.10.0/24"]);
         policy.validate().unwrap();
-        assert_eq!(policy.easytier_iface, "easytierw0");
+        assert_eq!(policy.easytier_iface, "tun0");
     }
 
     #[test]

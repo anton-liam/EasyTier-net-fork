@@ -11,6 +11,7 @@ pub struct PlanAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanActionKind {
     ProtectControlPlane,
+    ProtectLocalDirectRoutes,
     RouteManagedTraffic,
     PrepareForwarding,
     PrepareNat,
@@ -21,6 +22,9 @@ impl fmt::Display for PlanActionKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PlanActionKind::ProtectControlPlane => write!(f, "protect_control_plane"),
+            PlanActionKind::ProtectLocalDirectRoutes => {
+                write!(f, "protect_local_direct_routes")
+            }
             PlanActionKind::RouteManagedTraffic => write!(f, "route_managed_traffic"),
             PlanActionKind::PrepareForwarding => write!(f, "prepare_forwarding"),
             PlanActionKind::PrepareNat => write!(f, "prepare_nat"),
@@ -46,6 +50,12 @@ fn source_plan(policy: &DevicePolicy) -> Vec<PlanAction> {
             kind: PlanActionKind::ProtectControlPlane,
             description:
                 "ensure Web/config-server/relay/SSH underlay routes stay outside the tunnel"
+                    .to_string(),
+        },
+        PlanAction {
+            kind: PlanActionKind::ProtectLocalDirectRoutes,
+            description:
+                "keep ingress local-direct destinations on the main table for management access"
                     .to_string(),
         },
         PlanAction {
@@ -136,8 +146,9 @@ mod tests {
     fn source_plan_routes_managed_traffic_after_control_plane_protection() {
         let actions = dry_run_plan(&policy(DevicePolicyRole::ClientGatewayViaPeer)).unwrap();
         assert_eq!(actions[0].kind, PlanActionKind::ProtectControlPlane);
-        assert_eq!(actions[1].kind, PlanActionKind::RouteManagedTraffic);
-        assert!(actions[1].description.contains("10.126.126.3"));
+        assert_eq!(actions[1].kind, PlanActionKind::ProtectLocalDirectRoutes);
+        assert_eq!(actions[2].kind, PlanActionKind::RouteManagedTraffic);
+        assert!(actions[2].description.contains("10.126.126.3"));
     }
 
     #[test]

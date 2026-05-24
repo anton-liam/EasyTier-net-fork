@@ -53,7 +53,8 @@ impl OpenWrtBackend {
         ];
 
         for iface in &policy.ingress_ifaces {
-            commands.push(ingress_local_ip_rule_command(iface, self.table_id, "add"));
+            commands.push(ingress_local_ip_rule_command(iface, self.table_id));
+            commands.push(ingress_local_direct_route_command(iface));
         }
 
         for cidr in policy
@@ -66,7 +67,8 @@ impl OpenWrtBackend {
                 [
                     "-c",
                     &format!(
-                        "ip rule del from {cidr} lookup {table} 2>/dev/null || true; ip rule add from {cidr} lookup {table}",
+                        "while ip rule del from {cidr} lookup {table} 2>/dev/null; do :; done; ip rule add pref 100 from {cidr} lookup {table}",
+                        cidr = cidr,
                         table = self.table_id
                     ),
                 ],
@@ -77,7 +79,9 @@ impl OpenWrtBackend {
                     [
                         "-c",
                         &format!(
-                            "ip rule del iif {iface} from {cidr} lookup {table} 2>/dev/null || true; ip rule add iif {iface} from {cidr} lookup {table}",
+                            "while ip rule del iif {iface} from {cidr} lookup {table} 2>/dev/null; do :; done; ip rule add pref 100 iif {iface} from {cidr} lookup {table}",
+                            iface = iface,
+                            cidr = cidr,
                             table = self.table_id
                         ),
                     ],
@@ -95,7 +99,7 @@ impl OpenWrtBackend {
                 [
                     "-c",
                     &format!(
-                        "ip rule del from 0.0.0.0/0 lookup {table} 2>/dev/null || true",
+                        "while ip rule del from 0.0.0.0/0 lookup {table} 2>/dev/null; do :; done",
                         table = self.table_id
                     ),
                 ],
@@ -106,7 +110,7 @@ impl OpenWrtBackend {
                     [
                         "-c",
                         &format!(
-                            "ip rule del iif {iface} lookup {table} 2>/dev/null || true; ip rule add iif {iface} lookup {table}",
+                            "while ip rule del iif {iface} lookup {table} 2>/dev/null; do :; done; ip rule add pref 100 iif {iface} lookup {table}",
                             table = self.table_id
                         ),
                     ],
@@ -143,7 +147,7 @@ impl OpenWrtBackend {
                     "-c",
                     &format!(
                         "nft insert rule inet fw4 forward ip saddr {} oifname {} accept comment {}",
-                        nft_string(cidr),
+                        cidr,
                         nft_string(easytier_iface),
                         nft_string(&policy.device_policy_id)
                     ),
@@ -155,7 +159,7 @@ impl OpenWrtBackend {
                     "-c",
                     &format!(
                         "nft insert rule inet fw4 forward ip saddr {} oifname != {} drop comment {}",
-                        nft_string(cidr),
+                        cidr,
                         nft_string(easytier_iface),
                         nft_string(&policy.device_policy_id)
                     ),
@@ -211,7 +215,8 @@ impl OpenWrtBackend {
     fn source_cleanup(&self, policy: &DevicePolicy) -> Vec<CommandPlan> {
         let mut commands = Vec::new();
         for iface in &policy.ingress_ifaces {
-            commands.push(ingress_local_ip_rule_command(iface, self.table_id, "del"));
+            commands.push(ingress_local_ip_rule_command(iface, self.table_id));
+            commands.push(ingress_local_direct_cleanup_command(iface));
         }
         for cidr in policy
             .managed_cidrs
@@ -223,7 +228,7 @@ impl OpenWrtBackend {
                 [
                     "-c",
                     &format!(
-                        "ip rule del from {cidr} lookup {table} 2>/dev/null || true",
+                        "while ip rule del from {cidr} lookup {table} 2>/dev/null; do :; done",
                         table = self.table_id
                     ),
                 ],
@@ -234,7 +239,7 @@ impl OpenWrtBackend {
                     [
                         "-c",
                         &format!(
-                            "ip rule del iif {iface} from {cidr} lookup {table} 2>/dev/null || true",
+                            "while ip rule del iif {iface} from {cidr} lookup {table} 2>/dev/null; do :; done",
                             table = self.table_id
                         ),
                     ],
@@ -252,7 +257,7 @@ impl OpenWrtBackend {
                     [
                         "-c",
                         &format!(
-                            "ip rule del iif {iface} lookup {table} 2>/dev/null || true",
+                            "while ip rule del iif {iface} lookup {table} 2>/dev/null; do :; done",
                             table = self.table_id
                         ),
                     ],
@@ -523,16 +528,44 @@ fn nat_sources(policy: &DevicePolicy) -> Vec<String> {
     sources
 }
 
-fn ingress_local_ip_rule_command(iface: &str, table_id: u32, action: &str) -> CommandPlan {
+fn ingress_local_ip_rule_command(iface: &str, table_id: u32) -> CommandPlan {
     let iface = shell_single_quote(iface);
     let script = format!(
         "ip -4 -o addr show dev {iface} | awk '{{print $4}}' | while read -r cidr; do \
 [ -n \"$cidr\" ] || continue; \
-ip rule {action} pref 100 from \"$cidr\" lookup {table} 2>/dev/null || true; \
+while ip rule del from \"$cidr\" lookup {table} 2>/dev/null; do :; done; \
 done",
         iface = iface,
-        action = action,
         table = table_id,
+    );
+    CommandPlan::new("sh", ["-c", &script])
+}
+
+fn ingress_local_ip_rule_cleanup_command(iface: &str, table_id: u32) -> CommandPlan {
+    ingress_local_ip_rule_command(iface, table_id)
+}
+
+fn ingress_local_direct_route_command(iface: &str) -> CommandPlan {
+    let iface = shell_single_quote(iface);
+    let script = format!(
+        "ip -4 -o addr show dev {iface} | awk '{{print $4}}' | while read -r cidr; do \
+[ -n \"$cidr\" ] || continue; \
+while ip rule del to \"$cidr\" lookup main 2>/dev/null; do :; done; \
+ip rule add pref 90 to \"$cidr\" lookup main; \
+done",
+        iface = iface,
+    );
+    CommandPlan::new("sh", ["-c", &script])
+}
+
+fn ingress_local_direct_cleanup_command(iface: &str) -> CommandPlan {
+    let iface = shell_single_quote(iface);
+    let script = format!(
+        "ip -4 -o addr show dev {iface} | awk '{{print $4}}' | while read -r cidr; do \
+[ -n \"$cidr\" ] || continue; \
+while ip rule del to \"$cidr\" lookup main 2>/dev/null; do :; done; \
+done",
+        iface = iface,
     );
     CommandPlan::new("sh", ["-c", &script])
 }
@@ -687,13 +720,13 @@ mod tests {
         assert!(command_text.contains("ip route replace default via 10.126.126.3"));
         assert!(command_text.contains("ip route replace blackhole default table 126 metric 32767"));
         assert!(command_text.contains("ip -4 -o addr show dev 'br-lan'"));
-        assert!(command_text.contains("ip rule add pref 100 from \"$cidr\" lookup 126"));
-        assert!(command_text.contains("ip rule add from 192.168.10.0/24 lookup 126"));
+        assert!(command_text.contains("while ip rule del from \"$cidr\" lookup 126"));
+        assert!(command_text.contains("ip rule add pref 100 from 192.168.10.0/24 lookup 126"));
         assert!(command_text.contains(
-            "nft insert rule inet fw4 forward ip saddr \\\"192.168.10.0/24\\\" oifname \\\"easytier0\\\" accept comment \\\"p1/source\\\""
+            "nft insert rule inet fw4 forward ip saddr 192.168.10.0/24 oifname \\\"easytier0\\\" accept comment \\\"p1/source\\\""
         ));
         assert!(command_text.contains(
-            "nft insert rule inet fw4 forward ip saddr \\\"192.168.10.0/24\\\" oifname != \\\"easytier0\\\" drop comment \\\"p1/source\\\""
+            "nft insert rule inet fw4 forward ip saddr 192.168.10.0/24 oifname != \\\"easytier0\\\" drop comment \\\"p1/source\\\""
         ));
         assert!(command_text.contains(
             "nft insert rule inet fw4 mangle_forward tcp flags syn tcp option maxseg size set 1220 comment \\\"p1/source\\\""
@@ -701,6 +734,52 @@ mod tests {
         assert!(!command_text.contains("set firewall.@zone"));
         assert!(!command_text.contains("network.wan"));
         assert!(!command_text.contains("network.lan"));
+    }
+
+    #[test]
+    fn source_apply_does_not_route_ingress_local_addresses_when_managed_cidrs_are_explicit() {
+        let backend = OpenWrtBackend::default();
+        let mut policy = policy(DevicePolicyRole::ClientGatewayViaPeer);
+        policy.include_device_traffic = false;
+        policy.managed_cidrs = vec!["192.168.100.0/24".to_string()];
+        policy.ingress_ifaces = vec!["br-lan".to_string()];
+
+        let commands = backend.plan_apply(&policy).unwrap();
+        let command_text = commands
+            .iter()
+            .map(|cmd| format!("{} {}", cmd.program, cmd.args.join(" ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(command_text.contains("while ip rule del from 192.168.100.0/24 lookup 126"));
+        assert!(command_text.contains("ip rule add pref 100 from 192.168.100.0/24 lookup 126"));
+        assert!(
+            command_text.contains("while ip rule del from \"$cidr\" lookup 126")
+                && !command_text.contains("ip rule add pref 100 from \"$cidr\" lookup 126"),
+            "ingress interface local addresses must be cleaned, not routed into the policy table: {command_text}"
+        );
+    }
+
+    #[test]
+    fn source_apply_protects_local_direct_destinations_on_ingress_interfaces() {
+        let backend = OpenWrtBackend::default();
+        let mut policy = policy(DevicePolicyRole::ClientGatewayViaPeer);
+        policy.include_device_traffic = false;
+        policy.managed_cidrs = vec!["192.168.100.0/24".to_string()];
+        policy.ingress_ifaces = vec!["br-lan".to_string()];
+
+        let commands = backend.plan_apply(&policy).unwrap();
+        let command_text = commands
+            .iter()
+            .map(|cmd| format!("{} {}", cmd.program, cmd.args.join(" ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            command_text.contains("ip -4 -o addr show dev 'br-lan'")
+                && command_text.contains("ip rule add pref 90 to \"$cidr\" lookup main"),
+            "local-direct destinations on ingress interfaces must stay on the main table: {command_text}"
+        );
     }
 
     #[test]
@@ -717,8 +796,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(command_text.contains("ip rule add iif br-lan lookup 126"));
-        assert!(command_text.contains("ip rule del from 0.0.0.0/0 lookup 126"));
+        assert!(command_text.contains("while ip rule del from 0.0.0.0/0 lookup 126"));
+        assert!(command_text.contains("ip rule add pref 100 iif br-lan lookup 126"));
         assert!(command_text.contains(
             "nft insert rule inet fw4 forward iifname \\\"br-lan\\\" oifname \\\"easytier0\\\" accept comment \\\"p1/source\\\""
         ));
@@ -761,7 +840,7 @@ mod tests {
                 && cmd
                     .args
                     .join(" ")
-                    .contains("ip rule del pref 100 from \"$cidr\" lookup 126")
+                    .contains("while ip rule del from \"$cidr\" lookup 126")
         }));
     }
 

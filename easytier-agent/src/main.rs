@@ -17,7 +17,7 @@ use easytier_agent::{
 };
 
 const DEFAULT_REAPPLY_INTERVAL: Duration = Duration::from_secs(60);
-const EASYTIER_IFACE_CANDIDATES: [&str; 2] = ["easytierw0", "easytier0"];
+const EASYTIER_IFACE_CANDIDATES: [&str; 3] = ["tun0", "easytierw0", "easytier0"];
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -338,7 +338,7 @@ mod tests {
                 && cmd
                     .args
                     .join(" ")
-                    .contains("ip rule del from 192.168.10.0/24 lookup 126 2>/dev/null || true")
+                    .contains("while ip rule del from 192.168.10.0/24 lookup 126")
         }));
         assert!(
             !commands
@@ -433,14 +433,14 @@ mod tests {
                 current_token: "machine-token".to_string(),
                 next_token: None,
                 next_token_status: None,
-                api_base_url: Some("http://10.126.126.1:11212".to_string()),
+                api_base_url: Some("http://10.126.126.1:11211".to_string()),
                 updated_at: "2026-05-20T10:00:00Z".to_string(),
             },
         )
         .unwrap();
 
         let target = super::report_target_from_flags(
-            Some("http://137.220.194.19:11212".to_string()),
+            Some("http://137.220.194.19:11211".to_string()),
             Some(2),
             None,
             Some(path),
@@ -449,7 +449,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(target.web_base_url, "http://10.126.126.1:11212");
+        assert_eq!(target.web_base_url, "http://10.126.126.1:11211");
     }
 
     #[test]
@@ -513,17 +513,67 @@ mod tests {
     }
 
     #[test]
-    fn explicit_easytier_ipv4_wins_over_interface_detection() {
+    fn detected_easytier_ipv4_wins_over_explicit_config() {
         assert_eq!(
-            super::resolve_easytier_ipv4(Some("10.126.126.9".to_string()), Some("easytierw0")),
+            super::resolve_easytier_ipv4_with_detector(
+                Some("10.126.126.9".to_string()),
+                Some("easytierw0"),
+                |_| Some("10.126.126.2".to_string()),
+            ),
+            Some("10.126.126.2".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_easytier_ipv4_is_used_when_interface_is_missing() {
+        assert_eq!(
+            super::resolve_easytier_ipv4_with_detector(
+                Some("10.126.126.9".to_string()),
+                None,
+                |_| None,
+            ),
             Some("10.126.126.9".to_string())
         );
     }
 
     #[test]
-    fn web_client_interface_is_preferred_when_auto_detecting_easytier_iface() {
-        assert_eq!(super::EASYTIER_IFACE_CANDIDATES[0], "easytierw0");
-        assert_eq!(super::EASYTIER_IFACE_CANDIDATES[1], "easytier0");
+    fn resolve_easytier_iface_with_detector_falls_back_when_explicit_iface_is_missing() {
+        let resolved = super::resolve_easytier_iface_with_detector(
+            Some("tun0".to_string()),
+            |iface| iface == "easytierw0",
+            || Some("easytierw0".to_string()),
+        );
+
+        assert_eq!(resolved.as_deref(), Some("easytierw0"));
+    }
+
+    #[test]
+    fn resolve_easytier_iface_with_detector_keeps_explicit_iface_when_it_exists() {
+        let resolved = super::resolve_easytier_iface_with_detector(
+            Some("tun0".to_string()),
+            |iface| iface == "tun0",
+            || Some("easytierw0".to_string()),
+        );
+
+        assert_eq!(resolved.as_deref(), Some("tun0"));
+    }
+
+    #[test]
+    fn resolve_easytier_iface_with_detector_falls_back_when_explicit_iface_is_absent() {
+        let resolved = super::resolve_easytier_iface_with_detector(
+            Some("tun0".to_string()),
+            |_| false,
+            || Some("easytierw0".to_string()),
+        );
+
+        assert_eq!(resolved.as_deref(), Some("easytierw0"));
+    }
+
+    #[test]
+    fn tun_interface_is_preferred_when_auto_detecting_easytier_iface() {
+        assert_eq!(super::EASYTIER_IFACE_CANDIDATES[0], "tun0");
+        assert_eq!(super::EASYTIER_IFACE_CANDIDATES[1], "easytierw0");
+        assert_eq!(super::EASYTIER_IFACE_CANDIDATES[2], "easytier0");
     }
 
     #[test]
@@ -747,6 +797,7 @@ fn run_managed_loop(
     max_iterations: Option<usize>,
 ) -> anyhow::Result<()> {
     let mut reconciler = PolicyReconciler::default();
+    let mut last_report: Option<AgentRuntimeReport> = None;
     run_loop_with_iteration(
         interval,
         max_iterations,
@@ -759,14 +810,19 @@ fn run_managed_loop(
                 credential_file.clone(),
                 bootstrap_token.clone(),
             )?;
-            run_reconcile_iteration(
+            let report = run_reconcile_iteration(
                 &target,
                 platform,
                 easytier_ipv4.clone(),
                 easytier_iface.clone(),
                 execute,
                 &mut reconciler,
-            )
+                last_report.as_ref(),
+            )?;
+            if let Some(report) = report {
+                last_report = Some(report);
+            }
+            Ok(())
         },
         thread::sleep,
     )
@@ -826,28 +882,41 @@ fn run_reconcile_iteration(
     easytier_iface: Option<String>,
     execute: bool,
     reconciler: &mut PolicyReconciler,
-) -> anyhow::Result<()> {
+    previous_report: Option<&AgentRuntimeReport>,
+) -> anyhow::Result<Option<AgentRuntimeReport>> {
     let policies = fetch_device_policies(target)?;
     let policies = ordered_device_policies(policies);
+    let resolved_easytier_iface =
+        resolve_easytier_iface_with_detector(easytier_iface.clone(), detect_iface_present, detect_easytier_iface);
     let observed_easytier_ipv4 =
-        resolve_easytier_ipv4(easytier_ipv4.clone(), easytier_iface.as_deref());
+        resolve_easytier_ipv4(easytier_ipv4.clone(), resolved_easytier_iface.as_deref());
     if policies.is_empty() {
         let report = build_idle_runtime_report(target.machine_id.clone(), observed_easytier_ipv4)
             .with_observation(detect_runtime_observation(
                 platform,
-                easytier_iface.as_deref(),
+                resolved_easytier_iface.as_deref(),
             ));
         post_runtime_report(target, &report)?;
         println!("{}", serde_json::to_string(&report)?);
-        return Ok(());
+        return Ok(Some(report));
     }
     let policies_to_apply = reconciler.policies_to_apply_at(
         &policies,
         Instant::now(),
         Some(DEFAULT_REAPPLY_INTERVAL),
     )?;
+    if policies_to_apply.is_empty() {
+        if let Some(previous_report) = previous_report {
+            let report = refresh_runtime_report_heartbeat(previous_report, platform);
+            post_runtime_report(target, &report)?;
+            println!("{}", serde_json::to_string(&report)?);
+            return Ok(Some(report));
+        }
+        return Ok(None);
+    }
+    let mut last_report = None;
     for mut policy in policies_to_apply {
-        apply_easytier_iface_override(&mut policy, easytier_iface.clone());
+        apply_easytier_iface_override(&mut policy, resolved_easytier_iface.clone());
         println!(
             "reconcile: {:?}",
             easytier_agent::ReconcileEvent::Apply(policy.device_policy_id.clone(), policy.version)
@@ -864,10 +933,26 @@ fn run_reconcile_iteration(
             execute,
             observation,
         );
+        reconciler.record_policy_status(
+            &policy.device_policy_id,
+            report.status,
+            Instant::now(),
+        );
         post_runtime_report(target, &report)?;
         println!("{}", serde_json::to_string(&report)?);
+        last_report = Some(report);
     }
-    Ok(())
+    Ok(last_report)
+}
+
+fn refresh_runtime_report_heartbeat(
+    report: &AgentRuntimeReport,
+    platform: PlatformKind,
+) -> AgentRuntimeReport {
+    report.clone().with_observation(detect_runtime_observation(
+        platform,
+        report.easytier_iface.as_deref(),
+    ))
 }
 
 fn run_once(
@@ -878,20 +963,22 @@ fn run_once(
     execute: bool,
 ) -> anyhow::Result<()> {
     let mut policies = ordered_device_policies(fetch_device_policies(&target)?);
+    let resolved_easytier_iface =
+        resolve_easytier_iface_with_detector(easytier_iface.clone(), detect_iface_present, detect_easytier_iface);
     let observed_easytier_ipv4 =
-        resolve_easytier_ipv4(easytier_ipv4.clone(), easytier_iface.as_deref());
+        resolve_easytier_ipv4(easytier_ipv4.clone(), resolved_easytier_iface.as_deref());
     if policies.is_empty() {
         let report = build_idle_runtime_report(target.machine_id.clone(), observed_easytier_ipv4)
             .with_observation(detect_runtime_observation(
                 platform,
-                easytier_iface.as_deref(),
+                resolved_easytier_iface.as_deref(),
             ));
         post_runtime_report(&target, &report)?;
         println!("{}", serde_json::to_string(&report)?);
         return Ok(());
     }
     for policy in &mut policies {
-        apply_easytier_iface_override(policy, easytier_iface.clone());
+        apply_easytier_iface_override(policy, resolved_easytier_iface.clone());
     }
     let mut reconciler = PolicyReconciler::default();
     for event in reconciler.reconcile(&policies)? {
@@ -930,13 +1017,44 @@ fn resolve_easytier_ipv4(
     explicit_ipv4: Option<String>,
     easytier_iface: Option<&str>,
 ) -> Option<String> {
-    explicit_ipv4
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            easytier_iface
-                .filter(|iface| !iface.trim().is_empty())
-                .and_then(detect_iface_ipv4)
-        })
+    resolve_easytier_ipv4_with_detector(explicit_ipv4, easytier_iface, detect_iface_ipv4)
+}
+
+fn detect_iface_present(iface: &str) -> bool {
+    ProcessCommand::new("ip")
+        .args(["link", "show", "dev", iface])
+        .output()
+        .ok()
+        .is_some_and(|output| output.status.success())
+}
+
+fn resolve_easytier_iface_with_detector<F, G>(
+    explicit_iface: Option<String>,
+    mut iface_exists: F,
+    mut detect_iface: G,
+) -> Option<String>
+where
+    F: FnMut(&str) -> bool,
+    G: FnMut() -> Option<String>,
+{
+    match explicit_iface {
+        Some(iface) if !iface.trim().is_empty() && iface_exists(iface.as_str()) => Some(iface),
+        Some(_) | None => detect_iface(),
+    }
+}
+
+fn resolve_easytier_ipv4_with_detector<F>(
+    explicit_ipv4: Option<String>,
+    easytier_iface: Option<&str>,
+    mut detect_iface_ipv4: F,
+) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    easytier_iface
+        .filter(|iface| !iface.trim().is_empty())
+        .and_then(|iface| detect_iface_ipv4(iface))
+        .or_else(|| explicit_ipv4.filter(|value| !value.trim().is_empty()))
 }
 
 fn detect_iface_ipv4(iface: &str) -> Option<String> {

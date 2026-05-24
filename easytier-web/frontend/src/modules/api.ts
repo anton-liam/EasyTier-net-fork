@@ -126,6 +126,7 @@ export interface QuickApplyGatewayPolicyRequest {
     exit_machine_id: string;
     network_instance_id?: string | null;
     managed_cidrs_mode: ManagedCidrsMode;
+    managed_cidrs?: string[];
     include_device_traffic: boolean;
 }
 
