@@ -116,6 +116,12 @@ async fn handle_proxy_rpc_by_session(
             payload,
             session
         ),
+        "gateway_policy.GatewayPolicyRpc" => match_service!(
+            easytier::proto::gateway_policy::GatewayPolicyRpcClientFactory<BaseController>,
+            method_name,
+            payload,
+            session
+        ),
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,

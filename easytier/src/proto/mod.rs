@@ -5,6 +5,7 @@ pub mod acl;
 pub mod api;
 pub mod common;
 pub mod error;
+pub mod gateway_policy;
 #[cfg(feature = "magic-dns")]
 pub mod magic_dns;
 pub mod peer_rpc;

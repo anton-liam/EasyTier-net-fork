@@ -1,5 +1,6 @@
 mod auth;
 pub(crate) mod captcha;
+mod gateway_policy;
 mod network;
 pub(crate) mod oidc;
 mod rpc;
@@ -270,6 +271,7 @@ impl RestfulServer {
             .route("/api/v1/sessions", get(Self::handle_list_all_sessions))
             .merge(NetworkApi::build_route())
             .merge(rpc::router())
+            .merge(gateway_policy::router())
             .route_layer(login_required!(Backend))
             .merge(auth::router().layer(Extension(self.feature_flags.clone())))
             .merge(oidc::router())

@@ -34,6 +34,12 @@ use crate::{
     web_client::{DefaultHooks, WebClientHooks},
 };
 
+#[cfg(feature = "gateway-policy")]
+use crate::{
+    gateway_policy::GatewayPolicyManager, proto::gateway_policy::GatewayPolicyRpcServer,
+    rpc_service::gateway_policy::GatewayPolicyRpcService,
+};
+
 pub struct ApiRpcServer<T: TunnelListener + 'static> {
     rpc_server: StandAloneServer<T>,
     protected_tcp_port: Option<u16>,
@@ -171,6 +177,15 @@ pub fn register_api_rpc_service(
 
     registry.register(
         CredentialManageRpcServer::new(CredentialManageRpcService::new(instance_manager.clone())),
+        "",
+    );
+}
+
+/// 注册网关策略 RPC 服务到指定 ServiceRegistry
+#[cfg(feature = "gateway-policy")]
+pub fn register_gateway_policy_rpc(registry: &ServiceRegistry, manager: Arc<GatewayPolicyManager>) {
+    registry.register(
+        GatewayPolicyRpcServer::new(GatewayPolicyRpcService::new(manager)),
         "",
     );
 }

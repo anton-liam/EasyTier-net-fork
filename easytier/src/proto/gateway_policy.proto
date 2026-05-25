@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+import "common.proto";
+
+package gateway_policy;
+
+// 网关角色：Source 负责 mark + policy route，Exit 负责 masquerade
+enum GatewayRole {
+  SOURCE = 0;
+  EXIT = 1;
+}
+
+// 网关策略状态
+enum GatewayState {
+  IDLE = 0;
+  APPLIED = 1;
+  DEGRADED = 2;
+}
+
+// 网关策略定义，由 C 节点下发到 A/B 节点
+message GatewayPolicy {
+  string policy_id = 1;
+  bool enabled = 2;
+  GatewayRole role = 3;
+  string source_machine_id = 4;
+  string exit_machine_id = 5;
+  repeated string managed_cidrs = 6;
+  string ingress_iface = 7;
+  string exit_peer_tun_ip = 8;
+  string exit_wan_iface = 9;
+  string easytier_iface = 10;
+}
+
+// 网关策略执行状态上报
+message GatewayPolicyStatus {
+  string policy_id = 1;
+  GatewayState state = 2;
+  string message = 3;
+}
+
+// 策略下发 RPC 服务
+service GatewayPolicyRpc {
+  rpc ApplyPolicy(GatewayPolicy) returns (GatewayPolicyStatus) {}
+  rpc RemovePolicy(common.Void) returns (common.Void) {}
+  rpc GetStatus(common.Void) returns (GatewayPolicyStatus) {}
+}

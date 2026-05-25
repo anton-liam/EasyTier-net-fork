@@ -168,6 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "src/proto/web.proto",
         "src/proto/magic_dns.proto",
         "src/proto/acl.proto",
+        "src/proto/gateway_policy.proto",
     ];
 
     for proto_file in proto_files.iter().chain(proto_files_reflect.iter()) {

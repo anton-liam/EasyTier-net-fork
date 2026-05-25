@@ -403,5 +403,7 @@ tracing = ["tokio/tracing", "dep:console-subscriber"]
 magic-dns = ["dep:hickory-client", "dep:hickory-server"]
 faketcp = ["dep:flume"]
 zstd = ["dep:zstd"]
+# 出口网关策略模块
+gateway-policy = []
 # For Network Extension on macOS
 macos-ne = []

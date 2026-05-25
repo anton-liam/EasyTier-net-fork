@@ -1337,6 +1337,12 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
 
     let manager = Arc::new(NetworkInstanceManager::new().with_config_path(cli.config_dir.clone()));
 
+    #[cfg(feature = "gateway-policy")]
+    let gateway_policy_manager = cli
+        .config_server
+        .as_ref()
+        .map(|_| Arc::new(crate::gateway_policy::GatewayPolicyManager::new()));
+
     let _rpc_server = ApiRpcServer::new(
         cli.rpc_portal_options.rpc_portal,
         cli.rpc_portal_options.rpc_portal_whitelist,
@@ -1346,6 +1352,27 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
     .await?;
 
     let _web_client = if let Some(config_server_url_s) = cli.config_server.as_ref() {
+        #[cfg(feature = "gateway-policy")]
+        let wc = {
+            let gw_manager = gateway_policy_manager
+                .clone()
+                .expect("gateway policy manager should exist when config-server is enabled");
+            web_client::run_web_client_with_gateway_policy(
+                config_server_url_s,
+                crate::common::MachineIdOptions {
+                    explicit_machine_id: cli.machine_id.clone(),
+                    state_dir: None,
+                },
+                cli.network_options.hostname.clone(),
+                cli.network_options.secure_mode.unwrap_or(false),
+                manager.clone(),
+                None,
+                gw_manager,
+            )
+            .await
+        };
+
+        #[cfg(not(feature = "gateway-policy"))]
         let wc = web_client::run_web_client(
             config_server_url_s,
             crate::common::MachineIdOptions {
@@ -1357,8 +1384,9 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             manager.clone(),
             None,
         )
-        .await
-        .inspect(|_| {
+        .await;
+
+        let wc = wc.inspect(|_| {
             log::info!(
                 server = config_server_url_s,
                 "Web client started successfully...",
@@ -1371,6 +1399,19 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
     } else {
         None
     };
+
+    #[cfg(feature = "gateway-policy")]
+    let (gateway_policy_shutdown_tx, gateway_policy_task) =
+        if let Some(gw_manager) = gateway_policy_manager.clone() {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let task_manager = gw_manager.clone();
+            let task = tokio::spawn(async move {
+                task_manager.run_loop(rx).await;
+            });
+            (Some(tx), Some(task))
+        } else {
+            (None, None)
+        };
 
     let _daemon_guard = if cli.daemon {
         Some(manager.register_daemon())
@@ -1479,23 +1520,46 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
     #[cfg(not(unix))]
     let sigterm = std::future::pending::<()>();
 
-    tokio::select! {
+    let shutdown_result: anyhow::Result<()> = tokio::select! {
         _ = manager.wait() => {
-            let infos = manager.collect_network_infos().await?;
-            if infos
-                .into_values()
-                .filter_map(|info| info.error_msg).next().is_some() {
-                return Err(anyhow::anyhow!("some instances stopped with errors"));
+            match manager.collect_network_infos().await {
+                Ok(infos) => {
+                    if infos
+                        .into_values()
+                        .filter_map(|info| info.error_msg).next().is_some() {
+                        Err(anyhow::anyhow!("some instances stopped with errors"))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Err(e) => Err(e),
             }
         }
         _ = tokio::signal::ctrl_c() => {
             log::info!("ctrl-c received, exiting...");
+            Ok(())
         }
 
         _ = sigterm, if cfg!(unix) => {
             log::warn!("terminate signal received, exiting...");
+            Ok(())
+        }
+    };
+
+    #[cfg(feature = "gateway-policy")]
+    {
+        if let Some(tx) = gateway_policy_shutdown_tx {
+            let _ = tx.send(true);
+        }
+        if let Some(task) = gateway_policy_task {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+        }
+        if let Some(gw_manager) = gateway_policy_manager {
+            gw_manager.cleanup().await;
         }
     }
+
+    shutdown_result?;
     Ok(())
 }
 

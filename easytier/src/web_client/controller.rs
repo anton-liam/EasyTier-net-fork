@@ -7,6 +7,9 @@ use crate::{
     web_client::WebClientHooks,
 };
 
+#[cfg(feature = "gateway-policy")]
+use crate::{gateway_policy::GatewayPolicyManager, rpc_service::api::register_gateway_policy_rpc};
+
 pub struct Controller {
     token: String,
     machine_id: uuid::Uuid,
@@ -14,6 +17,8 @@ pub struct Controller {
     device_os: DeviceOsInfo,
     manager: Arc<NetworkInstanceManager>,
     hooks: Arc<dyn WebClientHooks>,
+    #[cfg(feature = "gateway-policy")]
+    gateway_policy_manager: Option<Arc<GatewayPolicyManager>>,
 }
 
 impl Controller {
@@ -32,7 +37,15 @@ impl Controller {
             device_os,
             manager,
             hooks,
+            #[cfg(feature = "gateway-policy")]
+            gateway_policy_manager: None,
         }
+    }
+
+    /// 设置网关策略管理器
+    #[cfg(feature = "gateway-policy")]
+    pub fn set_gateway_policy_manager(&mut self, manager: Arc<GatewayPolicyManager>) {
+        self.gateway_policy_manager = Some(manager);
     }
 
     pub fn list_network_instance_ids(&self) -> Vec<uuid::Uuid> {
@@ -57,6 +70,11 @@ impl Controller {
 
     pub fn register_api_rpc_service(&self, registry: &ServiceRegistry) {
         register_api_rpc_service(&self.manager, registry, Some(self.hooks.clone()));
+
+        #[cfg(feature = "gateway-policy")]
+        if let Some(gw_manager) = &self.gateway_policy_manager {
+            register_gateway_policy_rpc(registry, gw_manager.clone());
+        }
     }
 
     pub(super) fn notify_manager_stopping(&self) {

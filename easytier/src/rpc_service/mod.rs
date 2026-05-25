@@ -2,6 +2,8 @@ mod acl_manage;
 mod config;
 mod connector_manage;
 mod credential_manage;
+#[cfg(feature = "gateway-policy")]
+pub(crate) mod gateway_policy;
 mod mapped_listener_manage;
 mod peer_center;
 mod peer_manage;

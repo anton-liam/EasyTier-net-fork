@@ -21,6 +21,9 @@ use tokio_util::task::AbortOnDropHandle;
 use url::Url;
 use uuid::Uuid;
 
+#[cfg(feature = "gateway-policy")]
+use crate::gateway_policy::GatewayPolicyManager;
+
 #[async_trait]
 pub trait WebClientHooks: Send + Sync {
     async fn pre_run_network_instance(&self, _cfg: &TomlConfigLoader) -> Result<(), String> {
@@ -87,17 +90,26 @@ impl WebClient {
         secure_mode: bool,
         manager: Arc<NetworkInstanceManager>,
         hooks: Option<Arc<dyn WebClientHooks>>,
+        #[cfg(feature = "gateway-policy")] gateway_policy_manager: Option<
+            Arc<GatewayPolicyManager>,
+        >,
     ) -> Self {
         let manager_guard = manager.register_daemon();
         let hooks = hooks.unwrap_or_else(|| Arc::new(DefaultHooks));
-        let controller = Arc::new(controller::Controller::new(
+        #[cfg_attr(not(feature = "gateway-policy"), allow(unused_mut))]
+        let mut controller = controller::Controller::new(
             token.to_string(),
             machine_id,
             hostname.to_string(),
             collect_device_os_info(),
             manager,
             hooks,
-        ));
+        );
+        #[cfg(feature = "gateway-policy")]
+        if let Some(manager) = gateway_policy_manager {
+            controller.set_gateway_policy_manager(manager);
+        }
+        let controller = Arc::new(controller);
         let connected = Arc::new(AtomicBool::new(false));
 
         let controller_clone = controller.clone();
@@ -238,6 +250,51 @@ pub async fn run_web_client(
     manager: Arc<NetworkInstanceManager>,
     hooks: Option<Arc<dyn WebClientHooks>>,
 ) -> Result<WebClient> {
+    run_web_client_inner(
+        config_server_url_s,
+        machine_id_opts,
+        hostname,
+        secure_mode,
+        manager,
+        hooks,
+        #[cfg(feature = "gateway-policy")]
+        None,
+    )
+    .await
+}
+
+/// 启动带网关策略能力的 WebClient，并通过同一个控制通道注册策略 RPC。
+#[cfg(feature = "gateway-policy")]
+pub async fn run_web_client_with_gateway_policy(
+    config_server_url_s: &str,
+    machine_id_opts: MachineIdOptions,
+    hostname: Option<String>,
+    secure_mode: bool,
+    manager: Arc<NetworkInstanceManager>,
+    hooks: Option<Arc<dyn WebClientHooks>>,
+    gateway_policy_manager: Arc<GatewayPolicyManager>,
+) -> Result<WebClient> {
+    run_web_client_inner(
+        config_server_url_s,
+        machine_id_opts,
+        hostname,
+        secure_mode,
+        manager,
+        hooks,
+        Some(gateway_policy_manager),
+    )
+    .await
+}
+
+async fn run_web_client_inner(
+    config_server_url_s: &str,
+    machine_id_opts: MachineIdOptions,
+    hostname: Option<String>,
+    secure_mode: bool,
+    manager: Arc<NetworkInstanceManager>,
+    hooks: Option<Arc<dyn WebClientHooks>>,
+    #[cfg(feature = "gateway-policy")] gateway_policy_manager: Option<Arc<GatewayPolicyManager>>,
+) -> Result<WebClient> {
     let machine_id = resolve_machine_id(&machine_id_opts)
         .with_context(|| "failed to resolve machine id for web client")?;
     let config_server_url = match Url::parse(config_server_url_s) {
@@ -298,6 +355,8 @@ pub async fn run_web_client(
         secure_mode,
         manager,
         hooks,
+        #[cfg(feature = "gateway-policy")]
+        gateway_policy_manager,
     ))
 }
 

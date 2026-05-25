@@ -34,6 +34,7 @@ easytier-panic.log
 
 # web
 node_modules
+.pnpm-store
 
 .vite
 

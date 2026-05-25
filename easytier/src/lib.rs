@@ -7,6 +7,8 @@ use clap_complete::{Generator, Shell};
 
 mod arch;
 mod gateway;
+#[cfg(feature = "gateway-policy")]
+pub mod gateway_policy;
 pub mod instance;
 mod peer_center;
 mod vpn_portal;
