@@ -170,6 +170,11 @@ fn validate_pair_request(req: &GatewayPolicyPairRequest) -> Result<(), HttpHandl
     Ok(())
 }
 
+/// 校验网关 pair 删除请求，确保还原策略不会在参数错误时留下半清理状态
+fn validate_pair_remove_request(req: &GatewayPolicyPairRequest) -> Result<(), HttpHandleError> {
+    validate_pair_request(req)
+}
+
 /// 校验 Linux 网口名，避免空值或明显非法参数进入命令执行
 fn validate_iface(field: &str, iface: &str) -> Result<(), HttpHandleError> {
     if iface.trim().is_empty() {
@@ -514,6 +519,8 @@ async fn handle_apply_pair_policy(
     )
     .await?;
 
+    // 基础 EasyTier network instance 属于设备管理配置，失败时保留；
+    // 下面只回滚 gateway policy 和 Source 原生 proxy/exit 补丁。
     patch_source_native_config(
         &client_mgr,
         user_id,
@@ -606,6 +613,7 @@ async fn handle_remove_pair_policy(
     Json(req): Json<GatewayPolicyPairRequest>,
 ) -> Result<StatusCode, HttpHandleError> {
     let user_id = current_user_id(&auth_session)?;
+    validate_pair_remove_request(&req)?;
 
     let source_result =
         remove_policy_from_machine(&client_mgr, user_id, &req.source_machine_id).await;
@@ -854,6 +862,29 @@ mod tests {
         req.source_peer_tun_ip = Some("not-an-ip".to_string());
 
         let err = validate_pair_request(&req).unwrap_err().0;
+
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn pair_remove_validation_accepts_request_without_network_bootstrap_fields() {
+        let mut req = pair_request();
+        req.network_name = None;
+        req.network_secret = None;
+        req.source_peer_tun_ip = None;
+        req.peer_urls.clear();
+        req.disable_p2p = None;
+
+        validate_pair_remove_request(&req).unwrap();
+    }
+
+    #[test]
+    fn pair_remove_validation_rejects_invalid_cidr_before_side_effects() {
+        let mut req = pair_request();
+        req.peer_urls.clear();
+        req.managed_cidrs = vec!["not-a-cidr".to_string()];
+
+        let err = validate_pair_remove_request(&req).unwrap_err().0;
 
         assert_eq!(err, StatusCode::BAD_REQUEST);
     }
