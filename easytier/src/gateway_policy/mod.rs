@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::proto::gateway_policy::{GatewayPolicy, GatewayPolicyStatus, GatewayState};
+use crate::proto::gateway_policy::{GatewayPolicy, GatewayPolicyStatus, GatewayRole, GatewayState};
 use executor::Executor;
 use monitor::Monitor;
 use state::StateMachine;
@@ -110,8 +110,9 @@ impl GatewayPolicyManager {
         let policy = sm.current_policy().cloned();
         drop(sm);
 
-        // 只在 Applied 状态下检查健康
-        if current_state != GatewayState::Applied {
+        // 只在已应用或已保护降级状态下检查健康
+        if current_state != GatewayState::Applied && current_state != GatewayState::DegradedGuarded
+        {
             return;
         }
 
@@ -122,14 +123,40 @@ impl GatewayPolicyManager {
         // 检查隧道健康状态
         let tunnel_ok = self.monitor.check_tunnel_health(&policy).await;
 
-        if !tunnel_ok {
-            warn!(policy_id = %policy.policy_id, "隧道异常，自动回滚策略");
-            if let Err(e) = self.executor.cleanup().await {
-                warn!(error = %e, "回滚清理失败");
+        if tunnel_ok && current_state == GatewayState::DegradedGuarded {
+            info!(policy_id = %policy.policy_id, "隧道恢复，重新应用网关策略");
+            if let Err(e) = self.executor.apply(&policy).await {
+                warn!(error = %e, "隧道恢复后策略重新应用失败");
+                return;
             }
             let mut sm = self.state_machine.write().await;
-            sm.transition_to_degraded();
-            sm.transition_to_idle();
+            sm.transition_to_applied(policy);
+            return;
+        }
+
+        if !tunnel_ok && current_state == GatewayState::Applied {
+            warn!(policy_id = %policy.policy_id, "隧道异常，自动回滚策略");
+            let role = GatewayRole::try_from(policy.role).unwrap_or(GatewayRole::Source);
+            if role == GatewayRole::Source {
+                if let Err(e) = self.executor.apply_source_guard(&policy).await {
+                    warn!(error = %e, "Source fail-closed guard 安装失败");
+                    let mut sm = self.state_machine.write().await;
+                    sm.transition_to_degraded();
+                    return;
+                }
+                if let Err(e) = self.executor.cleanup_policy_rules().await {
+                    warn!(error = %e, "Source 回滚清理失败");
+                }
+                let mut sm = self.state_machine.write().await;
+                sm.transition_to_degraded_guarded();
+            } else {
+                if let Err(e) = self.executor.cleanup().await {
+                    warn!(error = %e, "回滚清理失败");
+                }
+                let mut sm = self.state_machine.write().await;
+                sm.transition_to_degraded();
+                sm.transition_to_idle();
+            }
         }
     }
 

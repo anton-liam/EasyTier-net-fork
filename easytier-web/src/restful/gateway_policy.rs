@@ -12,7 +12,10 @@ use axum::{
     routing::{delete, get, post},
 };
 use axum_login::AuthUser as _;
-use easytier::proto::common::Void;
+use easytier::proto::api::config::{
+    ConfigPatchAction, ExitNodePatch, InstanceConfigPatch, PatchConfigRequest, ProxyNetworkPatch,
+};
+use easytier::proto::common::{IpAddr, Ipv4Inet, Void};
 use easytier::proto::gateway_policy::{GatewayPolicy, GatewayPolicyStatus, GatewayRole};
 use easytier::proto::rpc_types::controller::BaseController;
 use serde::Deserialize;
@@ -21,6 +24,54 @@ use std::sync::Arc;
 use super::{AppState, HttpHandleError, other_error};
 use crate::client_manager::{ClientManager, session::Session};
 use crate::db::UserIdInDb;
+
+/// 将网关 pair 请求转换成 EasyTier 原生配置补丁，用于补齐子网回程和出口 peer 选择
+fn build_source_native_patch_request(
+    req: &GatewayPolicyPairRequest,
+    action: ConfigPatchAction,
+) -> Result<PatchConfigRequest, HttpHandleError> {
+    let proxy_networks = req
+        .managed_cidrs
+        .iter()
+        .map(|cidr| {
+            let cidr = cidr.parse::<Ipv4Inet>().map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    other_error(format!("Invalid managed CIDR {}: {}", cidr, e)).into(),
+                )
+            })?;
+
+            Ok(ProxyNetworkPatch {
+                action: action.into(),
+                cidr: Some(cidr),
+                mapped_cidr: None,
+            })
+        })
+        .collect::<Result<Vec<_>, HttpHandleError>>()?;
+
+    let exit_node = req.exit_peer_tun_ip.parse::<IpAddr>().map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            other_error(format!(
+                "Invalid exit peer tunnel IP {}: {}",
+                req.exit_peer_tun_ip, e
+            ))
+            .into(),
+        )
+    })?;
+
+    Ok(PatchConfigRequest {
+        instance: None,
+        patch: Some(InstanceConfigPatch {
+            proxy_networks,
+            exit_nodes: vec![ExitNodePatch {
+                action: action.into(),
+                node: Some(exit_node),
+            }],
+            ..Default::default()
+        }),
+    })
+}
 
 /// 双节点网关策略编排请求，一次指定 Source 和 Exit
 #[derive(Debug, Deserialize)]
@@ -118,6 +169,32 @@ async fn remove_policy_from_machine(
     Ok(())
 }
 
+/// 通过 ConfigRpc 调整 Source 节点上的 EasyTier 原生子网代理和出口节点配置
+async fn patch_source_native_config(
+    client_mgr: &ClientManager,
+    user_id: UserIdInDb,
+    machine_id: &uuid::Uuid,
+    req: &GatewayPolicyPairRequest,
+    action: ConfigPatchAction,
+) -> Result<(), HttpHandleError> {
+    let session = gateway_session(client_mgr, user_id, machine_id)?;
+    let client = session
+        .scoped_client::<easytier::proto::api::config::ConfigRpcClientFactory<BaseController>>();
+    let patch = build_source_native_patch_request(req, action)?;
+
+    client
+        .patch_config(BaseController::default(), patch)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                other_error(format!("RPC Error: {:?}", e)).into(),
+            )
+        })?;
+
+    Ok(())
+}
+
 /// 下发网关策略到指定节点
 async fn handle_apply_policy(
     auth_session: super::users::AuthSession,
@@ -138,6 +215,15 @@ async fn handle_apply_pair_policy(
     Json(req): Json<GatewayPolicyPairRequest>,
 ) -> Result<Json<GatewayPolicyPairStatus>, HttpHandleError> {
     let user_id = current_user_id(&auth_session)?;
+
+    patch_source_native_config(
+        &client_mgr,
+        user_id,
+        &req.source_machine_id,
+        &req,
+        ConfigPatchAction::Add,
+    )
+    .await?;
 
     let exit_policy = GatewayPolicy {
         policy_id: req.policy_id.clone(),
@@ -164,8 +250,27 @@ async fn handle_apply_pair_policy(
         ..Default::default()
     };
 
-    let exit_status =
-        apply_policy_to_machine(&client_mgr, user_id, &req.exit_machine_id, exit_policy).await?;
+    let exit_status = match apply_policy_to_machine(
+        &client_mgr,
+        user_id,
+        &req.exit_machine_id,
+        exit_policy,
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(err) => {
+            let _ = patch_source_native_config(
+                &client_mgr,
+                user_id,
+                &req.source_machine_id,
+                &req,
+                ConfigPatchAction::Remove,
+            )
+            .await;
+            return Err(err);
+        }
+    };
 
     let source_status =
         match apply_policy_to_machine(&client_mgr, user_id, &req.source_machine_id, source_policy)
@@ -175,6 +280,14 @@ async fn handle_apply_pair_policy(
             Err(err) => {
                 let _ =
                     remove_policy_from_machine(&client_mgr, user_id, &req.exit_machine_id).await;
+                let _ = patch_source_native_config(
+                    &client_mgr,
+                    user_id,
+                    &req.source_machine_id,
+                    &req,
+                    ConfigPatchAction::Remove,
+                )
+                .await;
                 return Err(err);
             }
         };
@@ -199,9 +312,18 @@ async fn handle_remove_pair_policy(
     let source_result =
         remove_policy_from_machine(&client_mgr, user_id, &req.source_machine_id).await;
     let exit_result = remove_policy_from_machine(&client_mgr, user_id, &req.exit_machine_id).await;
+    let native_result = patch_source_native_config(
+        &client_mgr,
+        user_id,
+        &req.source_machine_id,
+        &req,
+        ConfigPatchAction::Remove,
+    )
+    .await;
 
     source_result?;
     exit_result?;
+    native_result?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -262,4 +384,84 @@ pub fn router() -> Router<super::AppStateInner> {
             "/api/v1/gateway-policy/:machine-id",
             delete(handle_remove_policy),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use easytier::proto::api::config::ConfigPatchAction;
+
+    fn pair_request() -> GatewayPolicyPairRequest {
+        GatewayPolicyPairRequest {
+            policy_id: "utm-gw-001".to_string(),
+            source_machine_id: uuid::Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+                .unwrap(),
+            exit_machine_id: uuid::Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap(),
+            managed_cidrs: vec!["192.168.128.0/24".to_string()],
+            ingress_iface: "br-lan".to_string(),
+            exit_peer_tun_ip: "10.126.126.3".to_string(),
+            exit_wan_iface: "eth0".to_string(),
+            easytier_iface: "tun0".to_string(),
+        }
+    }
+
+    #[test]
+    fn native_patch_adds_proxy_cidrs_and_exit_node_to_source() {
+        let request =
+            build_source_native_patch_request(&pair_request(), ConfigPatchAction::Add).unwrap();
+        let patch = request.patch.unwrap();
+
+        assert_eq!(patch.proxy_networks.len(), 1);
+        assert_eq!(
+            patch.proxy_networks[0].action,
+            ConfigPatchAction::Add as i32
+        );
+        assert_eq!(
+            patch.proxy_networks[0].cidr.unwrap().to_string(),
+            "192.168.128.0/24"
+        );
+        assert_eq!(patch.exit_nodes.len(), 1);
+        assert_eq!(patch.exit_nodes[0].action, ConfigPatchAction::Add as i32);
+        assert_eq!(
+            patch.exit_nodes[0].node.unwrap().to_string(),
+            "10.126.126.3"
+        );
+    }
+
+    #[test]
+    fn native_patch_removes_proxy_cidrs_and_exit_node_from_source() {
+        let request =
+            build_source_native_patch_request(&pair_request(), ConfigPatchAction::Remove).unwrap();
+        let patch = request.patch.unwrap();
+
+        assert_eq!(
+            patch.proxy_networks[0].action,
+            ConfigPatchAction::Remove as i32
+        );
+        assert_eq!(patch.exit_nodes[0].action, ConfigPatchAction::Remove as i32);
+    }
+
+    #[test]
+    fn native_patch_rejects_invalid_cidr() {
+        let mut req = pair_request();
+        req.managed_cidrs = vec!["not-a-cidr".to_string()];
+
+        let err = build_source_native_patch_request(&req, ConfigPatchAction::Add)
+            .unwrap_err()
+            .0;
+
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn native_patch_rejects_invalid_exit_node() {
+        let mut req = pair_request();
+        req.exit_peer_tun_ip = "not-an-ip".to_string();
+
+        let err = build_source_native_patch_request(&req, ConfigPatchAction::Add)
+            .unwrap_err()
+            .0;
+
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
 }

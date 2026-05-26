@@ -14,6 +14,8 @@ use crate::proto::gateway_policy::{GatewayPolicy, GatewayRole};
 
 /// nft 表名常量
 const NFT_TABLE: &str = "easytier_gw";
+/// fail-closed 防泄漏表名
+const NFT_GUARD_TABLE: &str = "easytier_gw_guard";
 /// fwmark 值
 const FWMARK: u32 = 0x7e;
 /// 策略路由表号
@@ -93,6 +95,33 @@ impl Executor {
         }
 
         info!("规则清理完成");
+        Ok(())
+    }
+
+    /// 仅清理策略路由和普通网关规则，保留 fail-closed guard
+    pub async fn cleanup_policy_rules(&self) -> Result<()> {
+        info!("清理网关策略规则，保留 fail-closed guard");
+
+        for command in plan_cleanup_policy_rules() {
+            let _ = run_command(&command).await;
+        }
+
+        info!("策略规则清理完成");
+        Ok(())
+    }
+
+    /// 安装 Source 角色 fail-closed guard，避免隧道异常时 D 子网回落到本地 WAN 出口
+    pub async fn apply_source_guard(&self, policy: &GatewayPolicy) -> Result<()> {
+        let commands = plan_source_guard(policy)?;
+
+        for command in plan_cleanup_guard() {
+            let _ = run_command(&command).await;
+        }
+
+        for command in commands {
+            run_command(&command).await?;
+        }
+
         Ok(())
     }
 
@@ -249,8 +278,6 @@ fn plan_source(policy: &GatewayPolicy) -> Result<Vec<CommandSpec>> {
             "route",
             "replace",
             "default",
-            "via",
-            policy.exit_peer_tun_ip.as_str(),
             "dev",
             easytier_iface.as_str(),
             "table",
@@ -427,6 +454,16 @@ fn plan_exit(policy: &GatewayPolicy) -> Result<Vec<CommandSpec>> {
 
 /// 生成清理命令，调用方会忽略不存在规则产生的错误
 fn plan_cleanup() -> Vec<CommandSpec> {
+    let mut commands = plan_cleanup_policy_rules();
+    commands.push(CommandSpec::new(
+        "nft",
+        ["delete", "table", "inet", NFT_GUARD_TABLE],
+    ));
+    commands
+}
+
+/// 生成普通策略清理命令，不删除 fail-closed guard
+fn plan_cleanup_policy_rules() -> Vec<CommandSpec> {
     vec![
         CommandSpec::optional(
             "sh",
@@ -459,6 +496,69 @@ fn plan_cleanup() -> Vec<CommandSpec> {
         ),
         CommandSpec::new("nft", ["delete", "table", "inet", NFT_TABLE]),
     ]
+}
+
+/// 生成 Source fail-closed guard，阻止受管 LAN 子网在隧道异常时从普通转发路径出网
+fn plan_source_guard(policy: &GatewayPolicy) -> Result<Vec<CommandSpec>> {
+    validate_common(policy)?;
+    validate_iface("ingress_iface", &policy.ingress_iface)?;
+
+    let mut commands = vec![
+        CommandSpec::new("nft", ["add", "table", "inet", NFT_GUARD_TABLE]),
+        CommandSpec::new(
+            "nft",
+            [
+                "add",
+                "chain",
+                "inet",
+                NFT_GUARD_TABLE,
+                "forward",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "forward",
+                "priority",
+                "-140",
+                ";",
+                "}",
+            ],
+        ),
+    ];
+
+    for cidr in &policy.managed_cidrs {
+        commands.push(CommandSpec::new(
+            "nft",
+            [
+                "add",
+                "rule",
+                "inet",
+                NFT_GUARD_TABLE,
+                "forward",
+                "iifname",
+                policy.ingress_iface.as_str(),
+                "ip",
+                "saddr",
+                cidr.as_str(),
+                "ip",
+                "daddr",
+                "!=",
+                cidr.as_str(),
+                "counter",
+                "drop",
+            ],
+        ));
+    }
+
+    Ok(commands)
+}
+
+/// 生成 fail-closed guard 清理命令
+fn plan_cleanup_guard() -> Vec<CommandSpec> {
+    vec![CommandSpec::new(
+        "nft",
+        ["delete", "table", "inet", NFT_GUARD_TABLE],
+    )]
 }
 
 /// 校验策略的通用字段
@@ -580,24 +680,20 @@ mod tests {
     }
 
     #[test]
-    fn source_plan_uses_configured_tunnel_iface_and_replace_route() {
+    fn source_plan_uses_configured_tunnel_iface_and_default_route() {
         let executor = Executor::new();
         let commands = executor.plan_apply(&source_policy()).unwrap();
 
         assert!(commands.iter().any(|cmd| {
             cmd.cmd == "ip"
-                && cmd.args
-                    == vec![
-                        "route",
-                        "replace",
-                        "default",
-                        "via",
-                        "10.126.126.3",
-                        "dev",
-                        "et0",
-                        "table",
-                        "126",
-                    ]
+                && cmd.args == vec!["route", "replace", "default", "dev", "et0", "table", "126"]
+        }));
+        assert!(!commands.iter().any(|cmd| {
+            cmd.cmd == "ip"
+                && cmd
+                    .args
+                    .windows(2)
+                    .any(|window| window == ["via", "10.126.126.3"])
         }));
     }
 
@@ -802,6 +898,21 @@ mod tests {
         assert!(commands.iter().any(|cmd| {
             cmd.cmd == "nft" && cmd.args == vec!["delete", "table", "inet", NFT_TABLE]
         }));
+        assert!(commands.iter().any(|cmd| {
+            cmd.cmd == "nft" && cmd.args == vec!["delete", "table", "inet", NFT_GUARD_TABLE]
+        }));
+    }
+
+    #[test]
+    fn policy_cleanup_plan_keeps_fail_closed_guard() {
+        let commands = plan_cleanup_policy_rules();
+
+        assert!(commands.iter().any(|cmd| {
+            cmd.cmd == "nft" && cmd.args == vec!["delete", "table", "inet", NFT_TABLE]
+        }));
+        assert!(!commands.iter().any(|cmd| {
+            cmd.cmd == "nft" && cmd.args == vec!["delete", "table", "inet", NFT_GUARD_TABLE]
+        }));
     }
 
     #[test]
@@ -829,6 +940,37 @@ mod tests {
                         && arg.contains("/easytier_gw/")
                         && arg.contains("nft delete rule inet fw4 \"$chain\" handle")
                 })
+        }));
+    }
+
+    #[test]
+    fn source_guard_plan_drops_managed_lan_forward_when_tunnel_is_unhealthy() {
+        let commands = plan_source_guard(&source_policy()).unwrap();
+
+        assert!(commands.iter().any(|cmd| {
+            cmd.cmd == "nft" && cmd.args == vec!["add", "table", "inet", NFT_GUARD_TABLE]
+        }));
+        assert!(commands.iter().any(|cmd| {
+            cmd.cmd == "nft"
+                && cmd.args
+                    == vec![
+                        "add",
+                        "rule",
+                        "inet",
+                        NFT_GUARD_TABLE,
+                        "forward",
+                        "iifname",
+                        "br-lan",
+                        "ip",
+                        "saddr",
+                        "192.168.128.0/24",
+                        "ip",
+                        "daddr",
+                        "!=",
+                        "192.168.128.0/24",
+                        "counter",
+                        "drop",
+                    ]
         }));
     }
 }

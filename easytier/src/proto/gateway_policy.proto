@@ -15,6 +15,7 @@ enum GatewayState {
   IDLE = 0;
   APPLIED = 1;
   DEGRADED = 2;
+  DEGRADED_GUARDED = 3;
 }
 
 // 网关策略定义，由 C 节点下发到 A/B 节点

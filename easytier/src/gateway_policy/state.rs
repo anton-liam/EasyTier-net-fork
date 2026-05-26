@@ -1,9 +1,10 @@
 //! 网关策略状态机
 //!
-//! 三状态模型：Idle → Applied → Degraded → Idle
+//! 状态模型：Idle → Applied → Degraded/DegradedGuarded
 //! - Idle：无策略或策略已清除
 //! - Applied：策略已应用且隧道健康
 //! - Degraded：隧道异常，策略已回滚（过渡状态，立即转为 Idle）
+//! - DegradedGuarded：Source 隧道异常，已安装 fail-closed guard，等待隧道恢复
 
 use tracing::info;
 
@@ -58,6 +59,12 @@ impl StateMachine {
         self.state = GatewayState::Degraded;
     }
 
+    /// 转换到 DegradedGuarded 状态，保留当前策略用于隧道恢复后重新应用
+    pub fn transition_to_degraded_guarded(&mut self) {
+        info!(from = ?self.state, "状态转换 → DegradedGuarded");
+        self.state = GatewayState::DegradedGuarded;
+    }
+
     /// 生成当前状态报告
     pub fn status(&self) -> GatewayPolicyStatus {
         let policy_id = self
@@ -70,6 +77,7 @@ impl StateMachine {
             GatewayState::Idle => "空闲".to_string(),
             GatewayState::Applied => "策略已应用".to_string(),
             GatewayState::Degraded => "隧道异常，策略已回滚".to_string(),
+            GatewayState::DegradedGuarded => "隧道异常，已阻断受管流量防止泄漏".to_string(),
         };
 
         GatewayPolicyStatus {
@@ -114,6 +122,21 @@ mod tests {
         sm.transition_to_idle();
         assert_eq!(sm.state(), GatewayState::Idle);
         assert!(sm.current_policy().is_none());
+    }
+
+    #[test]
+    fn guarded_degraded_state_keeps_policy_for_recovery() {
+        let mut sm = StateMachine::new();
+        sm.transition_to_applied(GatewayPolicy {
+            policy_id: "gw-guard".to_string(),
+            ..Default::default()
+        });
+
+        sm.transition_to_degraded_guarded();
+
+        assert_eq!(sm.state(), GatewayState::DegradedGuarded);
+        assert_eq!(sm.current_policy().unwrap().policy_id, "gw-guard");
+        assert_eq!(sm.status().message, "隧道异常，已阻断受管流量防止泄漏");
     }
 
     #[test]
