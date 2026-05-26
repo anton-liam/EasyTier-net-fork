@@ -162,12 +162,24 @@ fn validate_pair_request(req: &GatewayPolicyPairRequest) -> Result<(), HttpHandl
             ));
         }
         for peer_url in &req.peer_urls {
-            url::Url::parse(peer_url)
-                .map_err(|e| bad_request(format!("Invalid peer URL {}: {}", peer_url, e)))?;
+            validate_peer_url(peer_url)?;
         }
     }
 
     Ok(())
+}
+
+/// 校验产品允许的 EasyTier peer URL；当前 C relay 只允许 tcp/udp
+fn validate_peer_url(peer_url: &str) -> Result<(), HttpHandleError> {
+    let url = url::Url::parse(peer_url)
+        .map_err(|e| bad_request(format!("Invalid peer URL {}: {}", peer_url, e)))?;
+    match url.scheme() {
+        "tcp" | "udp" => Ok(()),
+        scheme => Err(bad_request(format!(
+            "Unsupported peer URL scheme {} in {}. Allowed schemes: tcp, udp",
+            scheme, peer_url
+        ))),
+    }
 }
 
 /// 校验网关 pair 删除请求，确保还原策略不会在参数错误时留下半清理状态
@@ -864,6 +876,27 @@ mod tests {
         let err = validate_pair_request(&req).unwrap_err().0;
 
         assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn pair_request_validation_rejects_unsupported_peer_url_scheme() {
+        let mut req = pair_request();
+        req.peer_urls = vec!["http://192.168.64.4:11010".to_string()];
+
+        let err = validate_pair_request(&req).unwrap_err().0;
+
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn pair_request_validation_allows_tcp_and_udp_peer_url_schemes() {
+        let mut req = pair_request();
+        req.peer_urls = vec![
+            "udp://192.168.64.4:11010".to_string(),
+            "tcp://192.168.64.4:11010".to_string(),
+        ];
+
+        validate_pair_request(&req).unwrap();
     }
 
     #[test]
